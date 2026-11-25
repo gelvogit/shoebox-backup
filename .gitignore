@@ -1,0 +1,16 @@
+# Your real settings and secrets never go in git (copy the *.example files)
+.env
+.env.*
+!.env.example
+backupconfig.xml
+*.xml
+!backupconfig.example.xml
+!tests/*.xml
+
+# Runtime
+*.log
+status.json
+__pycache__/
+*.pyc
+*.part
+*.failed

@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Shoebox example config. Copy to backupconfig.xml (git-ignored) and edit.
+  This file says WHAT to back up and how long to keep it. Server connections, logins and the report
+  address live in .env (see .env.example): SMTP_*, EMAIL_*, MYSQL_HOST/USERNAME/PASSWORD, DROPBOX_*.
+  Those settings are also accepted here as XML elements (email_server, email_username, mysql_host,
+  mysql_username, ...; a .env value wins). An email_password or mysql_password here works too, with a
+  warning until it is moved to .env.
+-->
+<nubackups>
+	<config>
+		<archive_label>MYSERVER</archive_label>          <!-- used in file names and as the Dropbox folder: letters, digits, _ . - -->
+		<local_folder>/var/backups/shoebox/</local_folder>  <!-- one sub-folder per run is kept here -->
+		<tar_exe>tar</tar_exe>                           <!-- GNU tar -->
+		<dropbox_chunksize>33554432</dropbox_chunksize>  <!-- upload chunk in bytes (4 MiB steps, max 148 MiB); 32 MiB is a good size -->
+
+		<local_keep_days>7</local_keep_days>             <!-- local runs older than this are removed; default 7 -->
+		<log_file>/var/log/shoebox/shoebox.log</log_file>        <!-- default: local_folder/shoebox.log -->
+		<status_file>/var/log/shoebox/status.json</status_file>  <!-- last run as JSON, for monitoring -->
+		<dropbox_folder>MYSERVER</dropbox_folder>        <!-- folder inside the Dropbox app folder; default archive_label -->
+
+		<!-- Dropbox retention: keep the newest run of each of the last N days / weeks / months.
+		     Leave the whole element out to keep every run. -->
+		<retention>
+			<daily>14</daily>
+			<weekly>8</weekly>
+			<monthly>12</monthly>
+		</retention>
+
+		<!-- Host MySQL / MariaDB (connection and login: MYSQL_HOST, MYSQL_USERNAME, MYSQL_PASSWORD in .env) -->
+		<mysql>y</mysql>                                 <!-- y or n -->
+		<mysql_exe>mysqldump --add-drop-table --single-transaction</mysql_exe>  <!-- the "force" option is ignored -->
+		<!-- runs against information_schema; the first column is the database name -->
+		<mysql_query>SELECT SCHEMA_NAME AS Dname FROM SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys')</mysql_query>
+
+		<!-- MariaDB/MySQL in Docker: every non-system database in each container, dumped inside the
+		     container with its own MARIADB_ROOT_PASSWORD (or MYSQL_ROOT_PASSWORD) -->
+		<docker_mysql>
+			<container>app-db</container>
+		</docker_mysql>
+	</config>
+
+	<folder_list>
+		<!-- folder_split y: one archive per sub-folder (plus one "-_top" archive for loose files at the top) -->
+		<folder>
+			<folder_label>WWW</folder_label>
+			<folder_path>/var/www/html/</folder_path>
+			<folder_split>y</folder_split>
+			<folder_split_exclude>
+				<exclude>TODELETE</exclude>          <!-- sub-folder names to skip -->
+			</folder_split_exclude>
+		</folder>
+		<folder>
+			<folder_label>ETC</folder_label>
+			<folder_path>/etc/</folder_path>
+			<folder_split>n</folder_split>
+		</folder>
+		<folder>
+			<folder_label>OPT</folder_label>
+			<folder_path>/opt/</folder_path>
+			<folder_split>n</folder_split>
+			<folder_exclude>opt/big-thing</folder_exclude>  <!-- tar exclude pattern (paths have no leading /); repeat the element for more -->
+		</folder>
+	</folder_list>
+</nubackups>
