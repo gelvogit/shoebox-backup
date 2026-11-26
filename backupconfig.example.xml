@@ -1,13 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
   Shoebox example config. Copy to backupconfig.xml (git-ignored) and edit.
-  This file says WHAT to back up and how long to keep it. Server connections, logins and the report
-  address live in .env (see .env.example): SMTP_*, EMAIL_*, MYSQL_HOST/USERNAME/PASSWORD, DROPBOX_*.
-  Those settings are also accepted here as XML elements (email_server, email_username, mysql_host,
-  mysql_username, ...; a .env value wins). An email_password or mysql_password here works too, with a
-  warning until it is moved to .env.
+  This file says WHAT to back up, how to reach the databases, and how long to keep it. It holds no
+  passwords: those, the report email settings and the Dropbox login live in .env (see .env.example).
+  The email settings are also accepted here as XML elements (email_server, email_username, ...; a .env
+  value wins); an email_password here works too, with a warning until it is moved to .env.
 -->
-<nubackups>
+<shoebox>
 	<config>
 		<archive_label>MYSERVER</archive_label>          <!-- used in file names and as the Dropbox folder: letters, digits, _ . - -->
 		<local_folder>/var/backups/shoebox/</local_folder>  <!-- one sub-folder per run is kept here -->
@@ -26,19 +25,47 @@
 			<weekly>8</weekly>
 			<monthly>12</monthly>
 		</retention>
-
-		<!-- Host MySQL / MariaDB (connection and login: MYSQL_HOST, MYSQL_USERNAME, MYSQL_PASSWORD in .env) -->
-		<mysql>y</mysql>                                 <!-- y or n -->
-		<mysql_exe>mysqldump --add-drop-table --single-transaction</mysql_exe>  <!-- the "force" option is ignored -->
-		<!-- runs against information_schema; the first column is the database name -->
-		<mysql_query>SELECT SCHEMA_NAME AS Dname FROM SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys')</mysql_query>
-
-		<!-- MariaDB/MySQL in Docker: every non-system database in each container, dumped inside the
-		     container with its own MARIADB_ROOT_PASSWORD (or MYSQL_ROOT_PASSWORD) -->
-		<docker_mysql>
-			<container>app-db</container>
-		</docker_mysql>
 	</config>
+
+	<!-- MySQL / MariaDB servers. One <database_server> each; leave <databases> out to back up no databases.
+	     Each database becomes <run>-<archive_label>-<label>-<database>.sql.gz, checked before it counts.
+	       <label>                   your name for the server (letters, digits, _ . -); used in file names
+	       <host> or <docker_container>   exactly one: a host name (localhost = this machine, over its socket)
+	                                 or a running Docker container (dumped inside it with `docker exec`)
+	       <port>                    optional, with <host> only
+	       <username>                required
+	       <password_env>            name of a variable in .env that holds the password, or
+	       <password_container_env>  name of a variable INSIDE the container that holds it (Docker only;
+	                                 the password never leaves the container), or
+	                                 neither: no password (socket login, or ~/.my.cnf on this machine)
+	       <mysql_exe>               optional dump program + options. Default: mysqldump (in a container:
+	                                 mariadb-dump or mysqldump, whichever it has). The options a restorable
+	                                 dump needs are always added; force is ignored.
+	       <mysql_query>             optional: which databases. Runs in information_schema; the first column
+	                                 is the database name. Default: every database except information_schema,
+	                                 performance_schema, mysql and sys. -->
+	<databases>
+		<database_server>
+			<label>host</label>
+			<host>localhost</host>
+			<username>root</username>                    <!-- no password element: root over the socket -->
+			<mysql_exe>mysqldump --add-drop-table --single-transaction</mysql_exe>
+			<mysql_query>SELECT SCHEMA_NAME FROM SCHEMATA WHERE SCHEMA_NAME NOT IN ('information_schema','performance_schema','mysql','sys','phpmyadmin')</mysql_query>
+		</database_server>
+		<database_server>
+			<label>shop</label>
+			<docker_container>shop-db</docker_container>
+			<username>root</username>
+			<password_container_env>MARIADB_ROOT_PASSWORD</password_container_env>  <!-- set by the image's environment -->
+		</database_server>
+		<database_server>
+			<label>crm</label>
+			<docker_container>crm-mysql</docker_container>
+			<username>backup</username>
+			<password_env>CRM_DB_PASSWORD</password_env>  <!-- CRM_DB_PASSWORD=... in .env -->
+			<mysql_query>SELECT SCHEMA_NAME FROM SCHEMATA WHERE SCHEMA_NAME IN ('crm')</mysql_query>
+		</database_server>
+	</databases>
 
 	<folder_list>
 		<!-- folder_split y: one archive per sub-folder (plus one "-_top" archive for loose files at the top) -->
@@ -62,4 +89,4 @@
 			<folder_exclude>opt/big-thing</folder_exclude>  <!-- tar exclude pattern (paths have no leading /); repeat the element for more -->
 		</folder>
 	</folder_list>
-</nubackups>
+</shoebox>

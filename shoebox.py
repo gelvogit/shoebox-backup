@@ -34,12 +34,16 @@ import xml.etree.ElementTree as ET
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HERE = os.path.dirname(os.path.realpath(__file__))
 RUN_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})$")          # run id, e.g. 2026-11-24-0030
 MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 SYSTEM_DBS = {"information_schema", "performance_schema"}
-DOCKER_SYSTEM_DBS = "'information_schema','performance_schema','mysql','sys'"
+DEFAULT_DB_QUERY = ("SELECT SCHEMA_NAME FROM SCHEMATA WHERE SCHEMA_NAME NOT IN "
+                    "('information_schema','performance_schema','mysql','sys')")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")    # labels and container names
+VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")          # environment variable names
+OLD_DB_TAGS = ("mysql", "mysql_host", "mysql_username", "mysql_password", "mysql_exe", "mysql_query", "docker_mysql")
 REQUIRED_DUMP_OPTS = ["--single-transaction", "--routines", "--triggers", "--events", "--hex-blob",
                       "--default-character-set=utf8mb4"]
 BANNED_DUMP_OPTS = {"--force", "-f"}  # a dump that skips errors is not a backup
@@ -108,7 +112,7 @@ def _int(node, tag, default):
 
 
 class Config:
-    """backupconfig.xml (what to back up) + .env (connections and logins)."""
+    """backupconfig.xml (what to back up, and how to reach the databases) + .env (passwords and logins)."""
 
     def __init__(self, xml_path, env):
         self.path = os.path.abspath(xml_path)
@@ -159,31 +163,19 @@ class Config:
             self.warnings.append("<email_password> is in the XML: move it to SMTP_PASSWORD in .env")
             self.email["password"] = self.email["password"] or _text(c, "email_password")
 
-        # host MySQL / MariaDB (<mysql> y/n stays in the XML: it is part of "what to back up")
-        self.mysql = _text(c, "mysql").lower() == "y"
-        self.mysql_host = pick("MYSQL_HOST", "mysql_host", "localhost")
-        self.mysql_username = pick("MYSQL_USERNAME", "mysql_username", "root")
-        self.mysql_password = env.get("MYSQL_PASSWORD", "")
-        if _text(c, "mysql_password"):
-            self.warnings.append("<mysql_password> is in the XML: move it to MYSQL_PASSWORD in .env")
-            self.mysql_password = self.mysql_password or _text(c, "mysql_password")
-        self.mysql_query = _text(c, "mysql_query") or (
-            "SELECT SCHEMA_NAME AS Dname FROM SCHEMATA WHERE SCHEMA_NAME NOT IN "
-            "('information_schema','performance_schema','mysql','sys')")
-        exe = shlex.split(_text(c, "mysql_exe") or "mysqldump")
-        banned = [o for o in exe[1:] if o in BANNED_DUMP_OPTS]
-        if banned:
-            self.warnings.append("<mysql_exe> option %s ignored: a dump that skips errors is not a backup"
-                                 % " ".join(banned))
-        self.dump_opts = [o for o in exe[1:] if o not in BANNED_DUMP_OPTS]
-        self.dump_opts += [o for o in REQUIRED_DUMP_OPTS if o.split("=")[0] not in
-                           [x.split("=")[0] for x in self.dump_opts]]
-        self.mysqldump = exe[0]
-
-        # Docker MariaDB/MySQL containers (dumped with the container's own root password)
-        dm = c.find("docker_mysql")
-        self.docker_containers = [(e.text or "").strip() for e in dm.findall("container")] if dm is not None else []
-        self.docker_containers = [x for x in self.docker_containers if x]
+        # Databases: <databases><database_server>, one per MySQL/MariaDB server (this machine, another host,
+        # or a Docker container). The old <mysql>/<docker_mysql> elements are refused, not guessed at.
+        old = [t for t in OLD_DB_TAGS if c.find(t) is not None]
+        if old:
+            raise ShoeboxError("<%s> is the old database format: list each server as a <database_server> "
+                               "inside <databases> (see backupconfig.example.xml)" % ">, <".join(old))
+        dbs = root.find("databases")
+        self.db_servers = [DbServer(n, i, env, self.warnings)
+                           for i, n in enumerate(dbs.findall("database_server") if dbs is not None else [], 1)]
+        labels = [d.name for d in self.db_servers]
+        dupes = sorted({x for x in labels if labels.count(x) > 1})
+        if dupes:
+            raise ShoeboxError("<database_server> labels must be unique: %s" % ", ".join(dupes))
 
         # Dropbox retention (None = keep every run)
         r = c.find("retention")
@@ -450,42 +442,113 @@ def _correct_offset(err):
 
 
 # ------------------------------------------------------------------------------------------- dumping
-def docker_sh(container, script, *args):
-    """docker exec <container> sh -c <script> with $1.. args; the container's root password stays inside it."""
-    pw = 'MYSQL_PWD="${MARIADB_ROOT_PASSWORD:-$MYSQL_ROOT_PASSWORD}"; export MYSQL_PWD; '
-    return ["docker", "exec", container, "sh", "-c", pw + script, "sh"] + list(args)
+def parse_dump_exe(text, where, warnings):
+    """<mysql_exe>: the dump program plus options. --force is dropped (a dump that skips errors is not a
+    backup) and the options a restorable dump needs are added. Returns (program or None, options)."""
+    exe = shlex.split(text or "")
+    banned = [o for o in exe[1:] if o in BANNED_DUMP_OPTS]
+    if banned:
+        warnings.append("%s: <mysql_exe> option %s ignored: a dump that skips errors is not a backup"
+                        % (where, " ".join(banned)))
+    opts = [o for o in exe[1:] if o not in BANNED_DUMP_OPTS]
+    opts += [o for o in REQUIRED_DUMP_OPTS if o.split("=")[0] not in [x.split("=")[0] for x in opts]]
+    return (exe[0] if exe else None), opts
 
 
-class DbSource:
-    """A MySQL/MariaDB server: the host one (mysql/mysqldump on this machine) or a Docker container."""
+class DbServer:
+    """One <database_server>: a MySQL/MariaDB server on this machine or another host (<host>), or in a Docker
+    container (<docker_container>, dumped inside the container). Nothing is assumed: the label, the login
+    and where its password comes from are all in the XML; only password values live in .env."""
 
-    def __init__(self, cfg, container=None):
-        self.cfg, self.container = cfg, container
-        self.name = safe_name(container) if container else "mysql"
+    def __init__(self, node, index, env, warnings):
+        where = "<database_server> #%d" % index
+        self.name = _text(node, "label")
+        if not NAME_RE.match(self.name):
+            raise ShoeboxError("%s needs a <label> of letters, digits, _ . - (got %r)" % (where, self.name))
+        where = "<database_server> %s" % self.name
+        self.where = where
+        self.container = _text(node, "docker_container")
+        self.host = _text(node, "host")
+        self.port = _text(node, "port")
+        if bool(self.container) == bool(self.host):
+            raise ShoeboxError("%s needs exactly one of <host> (this machine or another server) or "
+                               "<docker_container>" % where)
+        if self.container and not NAME_RE.match(self.container):
+            raise ShoeboxError("%s: <docker_container> %r is not a valid container name" % (where, self.container))
+        if self.port and (self.container or not self.port.isdigit()):
+            raise ShoeboxError("%s: <port> must be a number, and only goes with <host>" % where)
+        self.username = _text(node, "username")
+        if not self.username:
+            raise ShoeboxError("%s needs a <username>" % where)
+        if node.find("password") is not None:
+            raise ShoeboxError("%s: passwords do not go in the XML. Put it in .env and name that variable "
+                               "in <password_env>" % where)
+        self.password_env = _text(node, "password_env")
+        self.password_container_env = _text(node, "password_container_env")
+        if self.password_env and self.password_container_env:
+            raise ShoeboxError("%s: use <password_env> or <password_container_env>, not both" % where)
+        for tag, v in (("password_env", self.password_env), ("password_container_env", self.password_container_env)):
+            if v and not VAR_RE.match(v):
+                raise ShoeboxError("%s: <%s> must be a variable name, got %r" % (where, tag, v))
+        if self.password_container_env and not self.container:
+            raise ShoeboxError("%s: <password_container_env> only goes with <docker_container>" % where)
+        # A missing .env value fails this server at run time (the rest of the backup still runs)
+        self.password, self.error = None, ""
+        if self.password_env:
+            self.password = env.get(self.password_env, "")
+            if not self.password:
+                self.error = "%s is not set in .env" % self.password_env
+        self.exe, self.dump_opts = parse_dump_exe(_text(node, "mysql_exe"), where, warnings)
+        self.query_sql = _text(node, "mysql_query") or DEFAULT_DB_QUERY
+
+    def describe(self):
+        if self.container:
+            return "docker %s as %s" % (self.container, self.username)
+        return "%s%s as %s" % (self.host, ":" + self.port if self.port else "", self.username)
 
     def _env(self):
         env = dict(os.environ)
-        if not self.container and self.cfg.mysql_password:
-            env["MYSQL_PWD"] = self.cfg.mysql_password  # not on the command line, so not in `ps`
+        env.pop("MYSQL_PWD", None)
+        if self.password:
+            env["MYSQL_PWD"] = self.password  # passed in the environment, never on a command line (`ps`)
         return env
 
-    def query(self, sql, db="information_schema"):
-        if self.container:
-            cmd = docker_sh(self.container, 'c=$(command -v mariadb || command -v mysql); exec "$c" -uroot -NB -D "$1" -e "$2"',
-                            db, sql)
+    def _docker(self, script, args):
+        cmd = ["docker", "exec"]
+        if self.password:
+            cmd += ["-e", "MYSQL_PWD"]  # no value here: docker copies it from our environment
+            pre = ""
+        elif self.password_container_env:
+            v = self.password_container_env  # checked against VAR_RE
+            pre = ('MYSQL_PWD="${%s:-}"; [ -n "$MYSQL_PWD" ] || { echo "%s is not set in the container" >&2; '
+                   'exit 1; }; export MYSQL_PWD; ' % (v, v))
         else:
-            cmd = ["mysql", "-h", self.cfg.mysql_host, "-u", self.cfg.mysql_username, "-NB", "-D", db, "-e", sql]
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self._env())
+            pre = "unset MYSQL_PWD; "
+        return cmd + [self.container, "sh", "-c", pre + script, "sh"] + list(args)
+
+    def _host_args(self):
+        return ["-h", self.host] + (["-P", self.port] if self.port else []) + ["-u", self.username]
+
+    def query(self, sql, db="information_schema"):
+        if self.error:
+            raise ShoeboxError(self.error)
+        if self.container:
+            cmd = self._docker('c=$(command -v mariadb || command -v mysql) || { echo "no mysql client in the '
+                               'container" >&2; exit 127; }; exec "$c" -u "$1" -NB -D "$2" -e "$3"',
+                               [self.username, db, sql])
+        else:
+            client = shutil.which("mysql") or shutil.which("mariadb") or "mysql"
+            cmd = [client] + self._host_args() + ["-NB", "-D", db, "-e", sql]
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self._env())
+        except OSError as e:
+            raise ShoeboxError("%s: %s" % (self.name, e))
         if p.returncode != 0:
             raise ShoeboxError("%s: %s" % (self.name, p.stderr.decode("utf-8", "replace").strip()[-300:]))
         return [l for l in p.stdout.decode().splitlines() if l.strip()]
 
     def databases(self):
-        if self.container:
-            sql = "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME NOT IN (%s)" % DOCKER_SYSTEM_DBS
-        else:
-            sql = self.cfg.mysql_query
-        return [d.split("\t")[0] for d in self.query(sql) if d.split("\t")[0] not in SYSTEM_DBS]
+        return [d.split("\t")[0] for d in self.query(self.query_sql) if d.split("\t")[0] not in SYSTEM_DBS]
 
     def table_count(self, db):
         rows = self.query("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='%s' "
@@ -494,9 +557,12 @@ class DbSource:
 
     def dump_cmd(self, db):
         if self.container:
-            return docker_sh(self.container, 'd=$(command -v mariadb-dump || command -v mysqldump); exec "$d" -uroot "$@"',
-                             *(self.cfg.dump_opts + [db]))
-        return [self.cfg.mysqldump, "-h", self.cfg.mysql_host, "-u", self.cfg.mysql_username] + self.cfg.dump_opts + [db]
+            if self.exe:
+                return self._docker('exec "$@"', [self.exe, "-u", self.username] + self.dump_opts + [db])
+            return self._docker('d=$(command -v mariadb-dump || command -v mysqldump) || { echo "no mysqldump in '
+                                'the container" >&2; exit 127; }; exec "$d" "$@"',
+                                ["-u", self.username] + self.dump_opts + [db])
+        return [self.exe or "mysqldump"] + self._host_args() + self.dump_opts + [db]
 
 
 def dump_to_gzip(cmd, out_path, env=None):
@@ -601,9 +667,7 @@ class Run:
             self.log("OK   folder %-28s %9s %5ss" % (it["label"], human(rec["bytes"]), rec["secs"]))
 
     def do_databases(self):
-        sources = ([DbSource(self.cfg)] if self.cfg.mysql else []) + \
-                  [DbSource(self.cfg, c) for c in self.cfg.docker_containers]
-        for src in sources:
+        for src in self.cfg.db_servers:
             try:
                 dbs = src.databases()
             except ShoeboxError as e:
@@ -996,13 +1060,12 @@ def cmd_check(cfg, args):
         bad += not ok
         print("%-7s folder %-30s %s%s" % ("ok" if ok else "MISSING", it["label"], it["path"],
                                          "  (excl %s)" % ", ".join(it["excludes"]) if it["excludes"] else ""))
-    sources = ([DbSource(cfg)] if cfg.mysql else []) + [DbSource(cfg, c) for c in cfg.docker_containers]
-    for s in sources:
+    for s in cfg.db_servers:
         try:
-            print("ok      mysql  %-30s %s" % (s.name, ", ".join(s.databases())))
+            print("ok      db     %-30s %s  (%s)" % (s.name, ", ".join(s.databases()) or "no databases", s.describe()))
         except ShoeboxError as e:
             bad += 1
-            print("FAIL    mysql  %-30s %s" % (s.name, e))
+            print("FAIL    db     %-30s %s  (%s)" % (s.name, e, s.describe()))
     print("Retention %s" % (cfg.retention or "none (keep every run)"))
     print("Email   %s -> %s via %s:%s (%s), password %s" % (cfg.email["from"], cfg.email["to"], cfg.email["server"],
           cfg.email["port"], cfg.email["secure"] or "plain", "set" if cfg.email["password"] else "MISSING"))
@@ -1081,7 +1144,7 @@ def main(argv=None):
     r.add_argument("--dry-run", action="store_true", help="show what would happen, change nothing")
     r.add_argument("--only", nargs="+", metavar="LABEL", help="only these folder labels / DB sources / DB names")
     r.add_argument("--no-folders", action="store_true")
-    r.add_argument("--no-mysql", action="store_true")
+    r.add_argument("--no-databases", "--no-mysql", dest="no_mysql", action="store_true", help="skip the databases")
     r.add_argument("--no-dropbox", action="store_true", help="keep the run local only")
     r.add_argument("--no-email", action="store_true")
     r.add_argument("--email-to", metavar="ADDR", help="send this run's report here instead of EMAIL_TO")

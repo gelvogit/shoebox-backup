@@ -9,8 +9,10 @@ Shoebox. Use it next to a "real" backup tool (restic, Borg, ...) as the copy you
 - **One file, no dependencies:** `shoebox.py`, Python 3.8+ standard library only. No pip, no composer.
 - **Verified dumps:** a database dump counts only if `mysqldump` exits 0, the file ends with
   `-- Dump completed`, and it has one `CREATE TABLE` per table in the database. `--force` is never used.
-- **Docker databases too:** dumps every database in MariaDB/MySQL containers, inside the container, with the
-  container's own root password.
+- **Any MySQL/MariaDB server:** on this machine, on another host, or in a Docker container (dumped inside the
+  container with `docker exec`). Each server has its own login, dump options and choice of databases; nothing
+  is assumed. A password comes from `.env` or from a variable inside the container, never from the XML or a
+  command line.
 - **Verified uploads:** every file is checked against Dropbox's `content_hash` after upload. Big files go up in
   chunks, with retries on rate limits and network errors.
 - **Manifest:** each run has a `manifest.json` with every file's size and SHA-256.
@@ -74,7 +76,7 @@ shoebox.py --config CONF check                  # config, folders, databases, em
 shoebox.py --config CONF run --dry-run          # what would happen
 shoebox.py --config CONF run --no-email         # a real run, report to the terminal + log
 shoebox.py --config CONF run                    # nightly (cron)
-shoebox.py --config CONF run --only WWW mysql   # some folder labels / DB sources / DB names
+shoebox.py --config CONF run --only WWW host    # some folder labels / DB server labels / DB names
 shoebox.py --config CONF list [--sizes]         # runs in Dropbox and locally
 shoebox.py --config CONF restore latest --target /tmp/restore [--match .sql.gz]
 ```
@@ -89,8 +91,8 @@ Cron example: `30 0 * * * /opt/shoebox/shoebox.py --config /etc/shoebox/backupco
 ```
 Dropbox:  Apps/<your app>/<LABEL>/2026-11/2026-11-24-0030/
               2026-11-24-0030-LABEL-WWW-site-dir.tgz
-              2026-11-24-0030-LABEL-mysql-shop.sql.gz        (host server)
-              2026-11-24-0030-LABEL-app-db-wordpress.sql.gz  (Docker container app-db)
+              2026-11-24-0030-LABEL-host-blog.sql.gz         (database server labelled "host")
+              2026-11-24-0030-LABEL-shop-shop.sql.gz         (server "shop", a Docker container)
               manifest.json
 Local:    <local_folder>/2026-11-24-0030/ (same files), shoebox.log, status.json
 ```
@@ -99,15 +101,56 @@ Local:    <local_folder>/2026-11-24-0030/ (same files), shoebox.log, status.json
 
 Two files, two jobs:
 
-- **`backupconfig.xml`: what to back up.** Folders, databases, retention, local paths. Safe to keep in git.
-  See [`backupconfig.example.xml`](backupconfig.example.xml) (every option, commented).
-- **`.env`: this server's connections and logins.** SMTP server, login and report address (`SMTP_*`,
-  `EMAIL_*`), the MySQL host, user and password (`MYSQL_*`) and the Dropbox app (`DROPBOX_*`). Root-only,
-  never in git. See [`.env.example`](.env.example).
+- **`backupconfig.xml`: what to back up.** Folders, database servers, retention, local paths. It holds no
+  passwords, so it is safe to keep in git. See [`backupconfig.example.xml`](backupconfig.example.xml) (every
+  option, commented).
+- **`.env`: this server's secrets.** Database passwords (any variable names you choose), the report email
+  (`SMTP_*`, `EMAIL_*`) and the Dropbox app (`DROPBOX_*`). Root-only, never in git. See
+  [`.env.example`](.env.example).
 
-The connection settings are also accepted as XML elements (`<email_server>`, `<email_username>`,
-`<mysql_username>` and so on; a `.env` value wins). An inline `<email_password>` or `<mysql_password>` works
-too, with a warning until it is moved to `.env`.
+### Databases
+
+List each MySQL/MariaDB server in `<databases>`, one `<database_server>` each:
+
+```xml
+<databases>
+  <database_server>                       <!-- this machine, root over the socket -->
+    <label>host</label>
+    <host>localhost</host>
+    <username>root</username>
+  </database_server>
+  <database_server>                       <!-- a Docker container, using its own root password -->
+    <label>shop</label>
+    <docker_container>shop-db</docker_container>
+    <username>root</username>
+    <password_container_env>MARIADB_ROOT_PASSWORD</password_container_env>
+  </database_server>
+  <database_server>                       <!-- another server, password from .env -->
+    <label>crm</label>
+    <host>db.internal</host>
+    <port>3306</port>
+    <username>backup</username>
+    <password_env>CRM_DB_PASSWORD</password_env>
+    <mysql_query>SELECT SCHEMA_NAME FROM SCHEMATA WHERE SCHEMA_NAME IN ('crm')</mysql_query>
+  </database_server>
+</databases>
+```
+
+- `<label>` names the server in file names, reports and `run --only`.
+- Exactly one of `<host>` or `<docker_container>`. A container is dumped inside itself, so the host needs
+  only `docker`.
+- The password comes from `<password_env>` (a variable in `.env`), `<password_container_env>` (a variable
+  inside the container; it never leaves it), or neither (no password: socket login or `~/.my.cnf`). It reaches
+  `mysqldump` through `MYSQL_PWD`, never the command line. A `<password>` element is refused.
+- `<mysql_exe>` (optional) is the dump program and options; the options a restorable dump needs are always
+  added, and `--force` is dropped. `<mysql_query>` (optional) picks the databases: it runs in
+  `information_schema` and the first column is the name. The default is every database except
+  `information_schema`, `performance_schema`, `mysql` and `sys`.
+- A backup user needs at least `SELECT`, `SHOW VIEW`, `TRIGGER`, `EVENT` and `LOCK TABLES` (plus `PROCESS`
+  on MySQL 8) on the databases it dumps.
+
+The email settings are also accepted as XML elements (`<email_server>`, `<email_username>` and so on; a
+`.env` value wins). An inline `<email_password>` works too, with a warning until it is moved to `.env`.
 
 ## Tests
 

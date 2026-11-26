@@ -14,21 +14,22 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."
 import shoebox  # noqa: E402
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
-LEGACY = """<?xml version="1.0"?>
-<nubackups><config>
+BASE = """<?xml version="1.0"?>
+<shoebox><config>
   <archive_label>OLD_BOX</archive_label><local_folder>/tmp/x/</local_folder><tar_exe>/bin/tar</tar_exe>
   <dropbox_chunksize>4194304</dropbox_chunksize>
   <email_server>mail.example.com</email_server><email_port>2525</email_port><email_secure>tls</email_secure>
   <email_auth>y</email_auth><email_username>u</email_username><email_password>inline-pass</email_password>
   <email_to>a@example.com</email_to><email_from>b@example.com</email_from><email_from_name>Sys</email_from_name>
-  <mysql>n</mysql><mysql_host>localhost</mysql_host>
-  <mysql_exe>mysqldump --add-drop-table --single-transaction --force </mysql_exe>
-  <mysql_username>root</mysql_username><mysql_password>dbpass</mysql_password>
-  <mysql_query>SELECT SCHEMA_NAME AS Dname FROM SCHEMATA</mysql_query>
 </config><folder_list>
   <folder><folder_label>OPT</folder_label><folder_path>/opt/</folder_path><folder_split>n</folder_split>
     <folder_exclude>opt/hermes</folder_exclude><folder_split_exclude><exclude>TODELETE</exclude></folder_split_exclude></folder>
-</folder_list></nubackups>"""
+</folder_list></shoebox>"""
+
+
+def with_dbs(servers, base=None):
+    """BASE plus a <databases> section."""
+    return (base or BASE).replace("</folder_list>", "</folder_list><databases>%s</databases>" % servers)
 
 
 def write(path, text):
@@ -43,56 +44,54 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.label, "MYSERVER")
         self.assertEqual(cfg.chunk_size, 32 * 1024 * 1024)
         self.assertEqual(cfg.retention, {"daily": 14, "weekly": 8, "monthly": 12})
-        self.assertEqual(cfg.docker_containers, ["app-db"])
+        self.assertEqual([d.name for d in cfg.db_servers], ["host", "shop", "crm"])
+        host, shop, crm = cfg.db_servers
+        self.assertEqual((host.host, host.container, host.username, host.password), ("localhost", "", "root", None))
+        self.assertEqual((shop.container, shop.password_container_env), ("shop-db", "MARIADB_ROOT_PASSWORD"))
+        self.assertEqual((crm.password_env, crm.error), ("CRM_DB_PASSWORD", "CRM_DB_PASSWORD is not set in .env"))
         self.assertEqual(cfg.dropbox_folder, "/MYSERVER")
         self.assertEqual([f["label"] for f in cfg.folders], ["WWW", "ETC", "OPT"])
         self.assertEqual(cfg.folders[2]["excludes"], ["opt/big-thing"])
         self.assertEqual(cfg.warnings, [])
 
-    def test_legacy_config_secrets_and_force(self):
+    def test_inline_email_password_warns(self):
         with tempfile.TemporaryDirectory() as d:
-            cfg = shoebox.Config(write(os.path.join(d, "c.xml"), LEGACY), {})
+            cfg = shoebox.Config(write(os.path.join(d, "c.xml"), BASE), {})
         self.assertEqual(cfg.email["password"], "inline-pass")
-        self.assertEqual(cfg.mysql_password, "dbpass")
-        self.assertEqual(len(cfg.warnings), 3)  # email_password, mysql_password, --force
-        self.assertNotIn("--force", cfg.dump_opts)
-        for o in shoebox.REQUIRED_DUMP_OPTS:
-            self.assertIn(o, cfg.dump_opts)
-        self.assertEqual(cfg.dump_opts.count("--single-transaction"), 1)
+        self.assertEqual(len(cfg.warnings), 1)
+        self.assertEqual(cfg.db_servers, [])
         self.assertIsNone(cfg.retention)
         self.assertEqual(cfg.email["port"], 2525)
 
     def test_env_overrides_xml(self):
         with tempfile.TemporaryDirectory() as d:
-            cfg = shoebox.Config(write(os.path.join(d, "c.xml"), LEGACY), {"SMTP_PASSWORD": "from-env"})
+            cfg = shoebox.Config(write(os.path.join(d, "c.xml"), BASE), {"SMTP_PASSWORD": "from-env"})
         self.assertEqual(cfg.email["password"], "from-env")
 
     def test_connections_from_env(self):
         env = {"SMTP_HOST": "smtp.env.test", "SMTP_PORT": "465", "SMTP_SECURE": "SSL", "SMTP_AUTH": "n",
                "SMTP_USERNAME": "envuser", "EMAIL_TO": "to@env.test", "EMAIL_FROM": "from@env.test",
-               "EMAIL_FROM_NAME": "Env Box", "MYSQL_HOST": "db.env.test", "MYSQL_USERNAME": "backup"}
+               "EMAIL_FROM_NAME": "Env Box"}
         with tempfile.TemporaryDirectory() as d:
-            cfg = shoebox.Config(write(os.path.join(d, "c.xml"), LEGACY), env)
+            cfg = shoebox.Config(write(os.path.join(d, "c.xml"), BASE), env)
         e = cfg.email
         self.assertEqual((e["server"], e["port"], e["secure"], e["auth"]), ("smtp.env.test", 465, "ssl", False))
         self.assertEqual((e["username"], e["to"], e["from"], e["from_name"]),
                          ("envuser", "to@env.test", "from@env.test", "Env Box"))
-        self.assertEqual((cfg.mysql_host, cfg.mysql_username), ("db.env.test", "backup"))
         with tempfile.TemporaryDirectory() as d:
             with self.assertRaises(shoebox.ShoeboxError):
-                shoebox.Config(write(os.path.join(d, "c.xml"), LEGACY), {"SMTP_PORT": "abc"})
+                shoebox.Config(write(os.path.join(d, "c.xml"), BASE), {"SMTP_PORT": "abc"})
 
     def test_example_env_file(self):
         env = shoebox.load_env(os.path.join(ROOT, ".env.example"))
         cfg = shoebox.Config(os.path.join(ROOT, "backupconfig.example.xml"), env)
         self.assertEqual(cfg.email["server"], "smtp.example.com")
         self.assertEqual(cfg.email["secure"], "tls")
-        self.assertEqual(cfg.mysql_username, "root")
         self.assertEqual(cfg.warnings, [])
 
     def test_bad_label(self):
         with tempfile.TemporaryDirectory() as d:
-            p = write(os.path.join(d, "c.xml"), LEGACY.replace("OLD_BOX", "bad label/.."))
+            p = write(os.path.join(d, "c.xml"), BASE.replace("OLD_BOX", "bad label/.."))
             with self.assertRaises(shoebox.ShoeboxError):
                 shoebox.Config(p, {})
 
@@ -101,11 +100,136 @@ class ConfigTests(unittest.TestCase):
             for sub in ("siteA", "siteB", "TODELETE"):
                 os.makedirs(os.path.join(d, "www", sub))
             write(os.path.join(d, "www", "index.html"), "hi")
-            xml = LEGACY.replace("<folder_path>/opt/</folder_path><folder_split>n</folder_split>",
+            xml = BASE.replace("<folder_path>/opt/</folder_path><folder_split>n</folder_split>",
                                  "<folder_path>%s/www/</folder_path><folder_split>y</folder_split>" % d)
             cfg = shoebox.Config(write(os.path.join(d, "c.xml"), xml), {})
             labels = [i["label"] for i in cfg.folder_items()]
         self.assertEqual(labels, ["OPT-siteA", "OPT-siteB", "OPT-_top"])
+
+
+class DatabaseServerTests(unittest.TestCase):
+    def cfg(self, servers, env=None):
+        with tempfile.TemporaryDirectory() as d:
+            return shoebox.Config(write(os.path.join(d, "c.xml"), with_dbs(servers)), env or {})
+
+    def bad(self, servers, text):
+        with self.assertRaises(shoebox.ShoeboxError) as e:
+            self.cfg(servers)
+        self.assertIn(text, str(e.exception))
+
+    def test_old_format_is_refused(self):
+        for old in ("<mysql>y</mysql>", "<docker_mysql><container>db</container></docker_mysql>"):
+            with tempfile.TemporaryDirectory() as d:
+                p = write(os.path.join(d, "c.xml"), BASE.replace("</config>", old + "</config>"))
+                with self.assertRaises(shoebox.ShoeboxError) as e:
+                    shoebox.Config(p, {})
+            self.assertIn("old database format", str(e.exception))
+
+    def test_invalid_servers(self):
+        self.bad("<database_server><host>h</host><username>u</username></database_server>", "<label>")
+        self.bad("<database_server><label>a</label><username>u</username></database_server>", "exactly one")
+        self.bad("<database_server><label>a</label><host>h</host><docker_container>c</docker_container>"
+                 "<username>u</username></database_server>", "exactly one")
+        self.bad("<database_server><label>a</label><host>h</host></database_server>", "<username>")
+        self.bad("<database_server><label>a</label><host>h</host><username>u</username>"
+                 "<password>x</password></database_server>", "do not go in the XML")
+        self.bad("<database_server><label>a</label><host>h</host><username>u</username>"
+                 "<password_container_env>P</password_container_env></database_server>", "only goes with")
+        self.bad("<database_server><label>a</label><docker_container>c</docker_container><username>u</username>"
+                 "<password_env>P</password_env><password_container_env>Q</password_container_env>"
+                 "</database_server>", "not both")
+        self.bad("<database_server><label>a</label><host>h</host><username>u</username>"
+                 "<password_env>bad name</password_env></database_server>", "variable name")
+        self.bad("<database_server><label>a</label><host>h</host><port>x</port><username>u</username>"
+                 "</database_server>", "<port>")
+        self.bad("<database_server><label>a</label><docker_container>c; rm</docker_container>"
+                 "<username>u</username></database_server>", "container name")
+        one = "<database_server><label>a</label><host>h</host><username>u</username></database_server>"
+        self.bad(one + one, "unique")
+
+    def test_dump_options(self):
+        cfg = self.cfg("<database_server><label>a</label><host>h</host><username>u</username>"
+                       "<mysql_exe>/usr/bin/mysqldump --single-transaction --force</mysql_exe></database_server>")
+        srv = cfg.db_servers[0]
+        self.assertEqual(srv.exe, "/usr/bin/mysqldump")
+        self.assertNotIn("--force", srv.dump_opts)
+        for o in shoebox.REQUIRED_DUMP_OPTS:
+            self.assertIn(o, srv.dump_opts)
+        self.assertEqual(srv.dump_opts.count("--single-transaction"), 1)
+        self.assertEqual(len([w for w in cfg.warnings if "--force" in w]), 1)
+        self.assertEqual(srv.query_sql, shoebox.DEFAULT_DB_QUERY)
+
+    def test_passwords_never_on_the_command_line(self):
+        cfg = self.cfg(
+            "<database_server><label>remote</label><host>db.test</host><port>3307</port><username>bk</username>"
+            "<password_env>REMOTE_PW</password_env></database_server>"
+            "<database_server><label>app</label><docker_container>app-db</docker_container><username>bk</username>"
+            "<password_env>APP_PW</password_env><mysql_exe>mariadb-dump</mysql_exe></database_server>"
+            "<database_server><label>shop</label><docker_container>shop-db</docker_container><username>root</username>"
+            "<password_container_env>MARIADB_ROOT_PASSWORD</password_container_env></database_server>"
+            "<database_server><label>sock</label><host>localhost</host><username>root</username></database_server>"
+            "<database_server><label>nopw</label><docker_container>open-db</docker_container><username>root</username>"
+            "</database_server>",
+            {"REMOTE_PW": "s3cret-remote", "APP_PW": "s3cret-app"})
+        remote, app, shop, sock, nopw = cfg.db_servers
+        cmd = remote.dump_cmd("crm")
+        self.assertEqual(cmd[:7], ["mysqldump", "-h", "db.test", "-P", "3307", "-u", "bk"])
+        self.assertEqual(cmd[-1], "crm")
+        self.assertNotIn("s3cret-remote", " ".join(cmd))
+        self.assertEqual(remote._env()["MYSQL_PWD"], "s3cret-remote")
+        cmd = app.dump_cmd("app")
+        self.assertEqual(cmd[:6], ["docker", "exec", "-e", "MYSQL_PWD", "app-db", "sh"])
+        self.assertIn("mariadb-dump", cmd)
+        self.assertNotIn("s3cret-app", " ".join(cmd))
+        self.assertEqual(app._env()["MYSQL_PWD"], "s3cret-app")
+        cmd = shop.dump_cmd("shop")
+        self.assertNotIn("-e", cmd[:3])
+        self.assertIn('MYSQL_PWD="${MARIADB_ROOT_PASSWORD:-}"', cmd[5])
+        self.assertNotIn("MYSQL_PWD", shop._env())
+        self.assertEqual(sock.dump_cmd("x")[:5], ["mysqldump", "-h", "localhost", "-u", "root"])
+        self.assertNotIn("MYSQL_PWD", sock._env())
+        self.assertTrue(nopw.dump_cmd("x")[5].startswith("unset MYSQL_PWD; "))
+
+    def test_missing_env_password_fails_only_that_server(self):
+        srv = self.cfg("<database_server><label>a</label><host>h</host><username>u</username>"
+                       "<password_env>NOPE</password_env></database_server>").db_servers[0]
+        with self.assertRaises(shoebox.ShoeboxError) as e:
+            srv.databases()
+        self.assertIn("NOPE is not set in .env", str(e.exception))
+
+    def test_run_dumps_with_fake_client(self):
+        """A full local run against fake mysql/mysqldump programs that check the password arrives in MYSQL_PWD."""
+        with tempfile.TemporaryDirectory() as d:
+            bindir = os.path.join(d, "bin")
+            os.makedirs(bindir)
+            write(os.path.join(bindir, "mysql"),
+                  '#!/bin/sh\n[ "$MYSQL_PWD" = pw123 ] || { echo "Access denied" >&2; exit 1; }\n'
+                  'case "$*" in *"COUNT(*)"*) echo 2 ;; *) printf "blog\\nshop\\n" ;; esac\n')
+            write(os.path.join(bindir, "mysqldump"),
+                  '#!/bin/sh\n[ "$MYSQL_PWD" = pw123 ] || exit 1\n'
+                  'printf "CREATE TABLE `a` (\\n);\\nCREATE TABLE `b` (\\n);\\n-- Dump completed on now\\n"\n')
+            for f in ("mysql", "mysqldump"):
+                os.chmod(os.path.join(bindir, f), 0o755)
+            xml = with_dbs("<database_server><label>main</label><host>localhost</host><username>bk</username>"
+                           "<password_env>DB_PW</password_env></database_server>",
+                           BASE.replace("/tmp/x/", os.path.join(d, "out"))
+                               .replace("<folder_path>/opt/</folder_path>", "<folder_path>%s</folder_path>" % bindir)
+                               .replace("<tar_exe>/bin/tar</tar_exe>",
+                                        "<tar_exe>tar</tar_exe><status_file>%s/st.json</status_file>" % d))
+            cfgp = write(os.path.join(d, "c.xml"), xml)
+            envp = write(os.path.join(d, ".env"), "DB_PW=pw123\n")
+            old_path = os.environ["PATH"]
+            os.environ["PATH"] = bindir + os.pathsep + old_path
+            try:
+                rc = shoebox.main(["--config", cfgp, "--env", envp, "run", "--no-dropbox", "--no-email"])
+            finally:
+                os.environ["PATH"] = old_path
+            st = json.load(open(os.path.join(d, "st.json")))
+            self.assertEqual((rc, st["errors"]), (0, 0))
+            self.assertEqual([(x["source"], x["db"], x["tables"], x["expected"]) for x in st["databases"]],
+                             [("main", "blog", 2, 2), ("main", "shop", 2, 2)])
+            self.assertTrue(os.path.exists(os.path.join(st["local_dir"], st["databases"][0]["file"])))
+            self.assertTrue(st["databases"][0]["file"].endswith("-main-blog.sql.gz"))
 
 
 class EnvTests(unittest.TestCase):
@@ -200,7 +324,7 @@ class RunTests(unittest.TestCase):
             write(os.path.join(src, "skip", "b.txt"), "no")
             old = os.path.join(d, "out", "2020-01-01-0030")
             os.makedirs(old)
-            xml = LEGACY.replace("/tmp/x/", os.path.join(d, "out")) \
+            xml = BASE.replace("/tmp/x/", os.path.join(d, "out")) \
                         .replace("<folder_path>/opt/</folder_path>", "<folder_path>%s</folder_path>" % src) \
                         .replace("<folder_exclude>opt/hermes</folder_exclude>", "<folder_exclude>*/skip</folder_exclude>") \
                         .replace("<tar_exe>/bin/tar</tar_exe>", "<tar_exe>tar</tar_exe><status_file>%s/st.json</status_file>" % d)
@@ -225,7 +349,7 @@ class RunTests(unittest.TestCase):
 
     def test_dry_run_changes_nothing(self):
         with tempfile.TemporaryDirectory() as d:
-            xml = LEGACY.replace("/tmp/x/", os.path.join(d, "out")) \
+            xml = BASE.replace("/tmp/x/", os.path.join(d, "out")) \
                         .replace("<folder_path>/opt/</folder_path>", "<folder_path>%s</folder_path>" % d)
             cfgp = write(os.path.join(d, "c.xml"), xml)
             rc = shoebox.main(["--config", cfgp, "--env", os.path.join(d, "none"), "run", "--dry-run", "--no-dropbox"])
