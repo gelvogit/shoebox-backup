@@ -1,4 +1,5 @@
 """Shoebox tests: standard library unittest, no network, no database.  python3 -m unittest discover -s tests"""
+
 import datetime as dt
 import gzip
 import hashlib
@@ -18,9 +19,6 @@ BASE = """<?xml version="1.0"?>
 <shoebox><config>
   <archive_label>OLD_BOX</archive_label><local_folder>/tmp/x/</local_folder><tar_exe>/bin/tar</tar_exe>
   <dropbox_chunksize>4194304</dropbox_chunksize>
-  <email_server>mail.example.com</email_server><email_port>2525</email_port><email_secure>tls</email_secure>
-  <email_auth>y</email_auth><email_username>u</email_username><email_password>inline-pass</email_password>
-  <email_to>a@example.com</email_to><email_from>b@example.com</email_from><email_from_name>Sys</email_from_name>
 </config><folder_list>
   <folder><folder_label>OPT</folder_label><folder_path>/opt/</folder_path><folder_split>n</folder_split>
     <folder_exclude>opt/hermes</folder_exclude><folder_split_exclude><exclude>TODELETE</exclude></folder_split_exclude></folder>
@@ -30,6 +28,11 @@ BASE = """<?xml version="1.0"?>
 def with_dbs(servers, base=None):
     """BASE plus a <databases> section."""
     return (base or BASE).replace("</folder_list>", "</folder_list><databases>%s</databases>" % servers)
+
+
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
 
 
 def write(path, text):
@@ -51,36 +54,86 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((crm.password_env, crm.error), ("CRM_DB_PASSWORD", "CRM_DB_PASSWORD is not set in .env"))
         self.assertEqual(cfg.dropbox_folder, "/MYSERVER")
         self.assertEqual([f["label"] for f in cfg.folders], ["WWW", "ETC", "OPT"])
-        self.assertEqual(cfg.folders[2]["excludes"], ["opt/big-thing"])
+        self.assertEqual(cfg.folders[2]["excludes"], ["opt/big-thing", "*.tmp"])
+        self.assertEqual([f["split"] for f in cfg.folders], [True, False, False])
         self.assertEqual(cfg.warnings, [])
 
-    def test_inline_email_password_warns(self):
+    def bad_xml(self, xml, text, env=None):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(shoebox.ShoeboxError) as e:
+                shoebox.Config(write(os.path.join(d, "c.xml"), xml), env or {})
+        self.assertIn(text, str(e.exception))
+
+    def test_defaults(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = shoebox.Config(write(os.path.join(d, "c.xml"), BASE), {})
-        self.assertEqual(cfg.email["password"], "inline-pass")
-        self.assertEqual(len(cfg.warnings), 1)
         self.assertEqual(cfg.db_servers, [])
         self.assertIsNone(cfg.retention)
-        self.assertEqual(cfg.email["port"], 2525)
+        self.assertEqual((cfg.email["server"], cfg.email["port"], cfg.email["auth"]), ("", 587, True))
+        self.assertEqual(cfg.warnings, [])
 
-    def test_env_overrides_xml(self):
-        with tempfile.TemporaryDirectory() as d:
-            cfg = shoebox.Config(write(os.path.join(d, "c.xml"), BASE), {"SMTP_PASSWORD": "from-env"})
-        self.assertEqual(cfg.email["password"], "from-env")
+    def test_unknown_elements_are_refused(self):
+        self.bad_xml(
+            BASE.replace("</config>", "<email_server>m</email_server></config>"),
+            "unknown element <email_server> in <shoebox><config>: the report email settings go in .env",
+        )
+        self.bad_xml(BASE.replace("</config>", "<mysql>y</mysql></config>"), "<database_server> inside <databases>")
+        self.bad_xml(
+            BASE.replace("</config>", "<retention><dayly>3</dayly></retention></config>"),
+            "unknown element <dayly> in <shoebox><config><retention>",
+        )
+        self.bad_xml(BASE.replace("<folder_split>n</folder_split>", "<split>n</split>"), "unknown element <split>")
+        self.bad_xml(
+            BASE.replace("<shoebox>", "<nubackups>").replace("</shoebox>", "</nubackups>"),
+            "top element must be <shoebox>",
+        )
+        with tempfile.TemporaryDirectory() as d:  # comments are fine
+            shoebox.Config(write(os.path.join(d, "c.xml"), BASE.replace("<config>", "<config><!-- hi -->")), {})
+
+    def test_yes_no_values(self):
+        for word, want in (
+            ("y", True),
+            ("YES", True),
+            ("true", True),
+            ("1", True),
+            ("n", False),
+            ("No", False),
+            ("false", False),
+            ("", False),
+        ):
+            with tempfile.TemporaryDirectory() as d:
+                xml = BASE.replace("<folder_split>n</folder_split>", "<folder_split>%s</folder_split>" % word)
+                cfg = shoebox.Config(write(os.path.join(d, "c.xml"), xml), {})
+            self.assertEqual(cfg.folders[0]["split"], want, word)
+        self.bad_xml(BASE.replace("<folder_split>n", "<folder_split>maybe"), "must be yes or no")
+        self.bad_xml(BASE, "SMTP_AUTH in .env must be yes or no", {"SMTP_AUTH": "sometimes"})
+
+    def test_bad_email_env(self):
+        self.bad_xml(BASE, "SMTP_PORT in .env must be a number", {"SMTP_PORT": "abc"})
+        self.bad_xml(BASE, "SMTP_SECURE in .env must be tls, ssl or empty", {"SMTP_SECURE": "starttls"})
+
+    def test_bad_folder(self):
+        self.bad_xml(BASE.replace("<folder_label>OPT</folder_label>", ""), "needs a <folder_path> and a <folder_label>")
+        self.bad_xml(BASE.replace("<folder_label>OPT", "<folder_label>my files"), "needs a <folder_path>")
 
     def test_connections_from_env(self):
-        env = {"SMTP_HOST": "smtp.env.test", "SMTP_PORT": "465", "SMTP_SECURE": "SSL", "SMTP_AUTH": "n",
-               "SMTP_USERNAME": "envuser", "EMAIL_TO": "to@env.test", "EMAIL_FROM": "from@env.test",
-               "EMAIL_FROM_NAME": "Env Box"}
+        env = {
+            "SMTP_HOST": "smtp.env.test",
+            "SMTP_PORT": "465",
+            "SMTP_SECURE": "SSL",
+            "SMTP_AUTH": "n",
+            "SMTP_USERNAME": "envuser",
+            "EMAIL_TO": "to@env.test",
+            "EMAIL_FROM": "from@env.test",
+            "EMAIL_FROM_NAME": "Env Box",
+        }
         with tempfile.TemporaryDirectory() as d:
             cfg = shoebox.Config(write(os.path.join(d, "c.xml"), BASE), env)
         e = cfg.email
         self.assertEqual((e["server"], e["port"], e["secure"], e["auth"]), ("smtp.env.test", 465, "ssl", False))
-        self.assertEqual((e["username"], e["to"], e["from"], e["from_name"]),
-                         ("envuser", "to@env.test", "from@env.test", "Env Box"))
-        with tempfile.TemporaryDirectory() as d:
-            with self.assertRaises(shoebox.ShoeboxError):
-                shoebox.Config(write(os.path.join(d, "c.xml"), BASE), {"SMTP_PORT": "abc"})
+        self.assertEqual(
+            (e["username"], e["to"], e["from"], e["from_name"]), ("envuser", "to@env.test", "from@env.test", "Env Box")
+        )
 
     def test_example_env_file(self):
         env = shoebox.load_env(os.path.join(ROOT, ".env.example"))
@@ -100,8 +153,10 @@ class ConfigTests(unittest.TestCase):
             for sub in ("siteA", "siteB", "TODELETE"):
                 os.makedirs(os.path.join(d, "www", sub))
             write(os.path.join(d, "www", "index.html"), "hi")
-            xml = BASE.replace("<folder_path>/opt/</folder_path><folder_split>n</folder_split>",
-                                 "<folder_path>%s/www/</folder_path><folder_split>y</folder_split>" % d)
+            xml = BASE.replace(
+                "<folder_path>/opt/</folder_path><folder_split>n</folder_split>",
+                "<folder_path>%s/www/</folder_path><folder_split>y</folder_split>" % d,
+            )
             cfg = shoebox.Config(write(os.path.join(d, "c.xml"), xml), {})
             labels = [i["label"] for i in cfg.folder_items()]
         self.assertEqual(labels, ["OPT-siteA", "OPT-siteB", "OPT-_top"])
@@ -117,39 +172,53 @@ class DatabaseServerTests(unittest.TestCase):
             self.cfg(servers)
         self.assertIn(text, str(e.exception))
 
-    def test_old_format_is_refused(self):
-        for old in ("<mysql>y</mysql>", "<docker_mysql><container>db</container></docker_mysql>"):
-            with tempfile.TemporaryDirectory() as d:
-                p = write(os.path.join(d, "c.xml"), BASE.replace("</config>", old + "</config>"))
-                with self.assertRaises(shoebox.ShoeboxError) as e:
-                    shoebox.Config(p, {})
-            self.assertIn("old database format", str(e.exception))
-
     def test_invalid_servers(self):
         self.bad("<database_server><host>h</host><username>u</username></database_server>", "<label>")
         self.bad("<database_server><label>a</label><username>u</username></database_server>", "exactly one")
-        self.bad("<database_server><label>a</label><host>h</host><docker_container>c</docker_container>"
-                 "<username>u</username></database_server>", "exactly one")
+        self.bad(
+            "<database_server><label>a</label><host>h</host><docker_container>c</docker_container>"
+            "<username>u</username></database_server>",
+            "exactly one",
+        )
         self.bad("<database_server><label>a</label><host>h</host></database_server>", "<username>")
-        self.bad("<database_server><label>a</label><host>h</host><username>u</username>"
-                 "<password>x</password></database_server>", "do not go in the XML")
-        self.bad("<database_server><label>a</label><host>h</host><username>u</username>"
-                 "<password_container_env>P</password_container_env></database_server>", "only goes with")
-        self.bad("<database_server><label>a</label><docker_container>c</docker_container><username>u</username>"
-                 "<password_env>P</password_env><password_container_env>Q</password_container_env>"
-                 "</database_server>", "not both")
-        self.bad("<database_server><label>a</label><host>h</host><username>u</username>"
-                 "<password_env>bad name</password_env></database_server>", "variable name")
-        self.bad("<database_server><label>a</label><host>h</host><port>x</port><username>u</username>"
-                 "</database_server>", "<port>")
-        self.bad("<database_server><label>a</label><docker_container>c; rm</docker_container>"
-                 "<username>u</username></database_server>", "container name")
+        self.bad(
+            "<database_server><label>a</label><host>h</host><username>u</username>"
+            "<password>x</password></database_server>",
+            "do not go in the XML",
+        )
+        self.bad(
+            "<database_server><label>a</label><host>h</host><username>u</username>"
+            "<password_container_env>P</password_container_env></database_server>",
+            "only goes with",
+        )
+        self.bad(
+            "<database_server><label>a</label><docker_container>c</docker_container><username>u</username>"
+            "<password_env>P</password_env><password_container_env>Q</password_container_env>"
+            "</database_server>",
+            "not both",
+        )
+        self.bad(
+            "<database_server><label>a</label><host>h</host><username>u</username>"
+            "<password_env>bad name</password_env></database_server>",
+            "variable name",
+        )
+        self.bad(
+            "<database_server><label>a</label><host>h</host><port>x</port><username>u</username>" "</database_server>",
+            "<port>",
+        )
+        self.bad(
+            "<database_server><label>a</label><docker_container>c; rm</docker_container>"
+            "<username>u</username></database_server>",
+            "container name",
+        )
         one = "<database_server><label>a</label><host>h</host><username>u</username></database_server>"
         self.bad(one + one, "unique")
 
     def test_dump_options(self):
-        cfg = self.cfg("<database_server><label>a</label><host>h</host><username>u</username>"
-                       "<mysql_exe>/usr/bin/mysqldump --single-transaction --force</mysql_exe></database_server>")
+        cfg = self.cfg(
+            "<database_server><label>a</label><host>h</host><username>u</username>"
+            "<mysql_exe>/usr/bin/mysqldump --single-transaction --force</mysql_exe></database_server>"
+        )
         srv = cfg.db_servers[0]
         self.assertEqual(srv.exe, "/usr/bin/mysqldump")
         self.assertNotIn("--force", srv.dump_opts)
@@ -170,7 +239,8 @@ class DatabaseServerTests(unittest.TestCase):
             "<database_server><label>sock</label><host>localhost</host><username>root</username></database_server>"
             "<database_server><label>nopw</label><docker_container>open-db</docker_container><username>root</username>"
             "</database_server>",
-            {"REMOTE_PW": "s3cret-remote", "APP_PW": "s3cret-app"})
+            {"REMOTE_PW": "s3cret-remote", "APP_PW": "s3cret-app"},
+        )
         remote, app, shop, sock, nopw = cfg.db_servers
         cmd = remote.dump_cmd("crm")
         self.assertEqual(cmd[:7], ["mysqldump", "-h", "db.test", "-P", "3307", "-u", "bk"])
@@ -190,13 +260,11 @@ class DatabaseServerTests(unittest.TestCase):
         self.assertNotIn("MYSQL_PWD", sock._env())
         self.assertTrue(nopw.dump_cmd("x")[5].startswith("unset MYSQL_PWD; "))
 
-    def test_old_env_keys_warn(self):
-        cfg = self.cfg("", {"MYSQL_HOST": "x", "MYSQL_PASSWORD": "y"})
-        self.assertTrue(any("MYSQL_HOST, MYSQL_PASSWORD in .env is no longer used" in w for w in cfg.warnings))
-
     def test_missing_env_password_fails_only_that_server(self):
-        srv = self.cfg("<database_server><label>a</label><host>h</host><username>u</username>"
-                       "<password_env>NOPE</password_env></database_server>").db_servers[0]
+        srv = self.cfg(
+            "<database_server><label>a</label><host>h</host><username>u</username>"
+            "<password_env>NOPE</password_env></database_server>"
+        ).db_servers[0]
         with self.assertRaises(shoebox.ShoeboxError) as e:
             srv.databases()
         self.assertIn("NOPE is not set in .env", str(e.exception))
@@ -206,20 +274,27 @@ class DatabaseServerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             bindir = os.path.join(d, "bin")
             os.makedirs(bindir)
-            write(os.path.join(bindir, "mysql"),
-                  '#!/bin/sh\n[ "$MYSQL_PWD" = pw123 ] || { echo "Access denied" >&2; exit 1; }\n'
-                  'case "$*" in *"COUNT(*)"*) echo 2 ;; *) printf "blog\\nshop\\n" ;; esac\n')
-            write(os.path.join(bindir, "mysqldump"),
-                  '#!/bin/sh\n[ "$MYSQL_PWD" = pw123 ] || exit 1\n'
-                  'printf "CREATE TABLE `a` (\\n);\\nCREATE TABLE `b` (\\n);\\n-- Dump completed on now\\n"\n')
+            write(
+                os.path.join(bindir, "mysql"),
+                '#!/bin/sh\n[ "$MYSQL_PWD" = pw123 ] || { echo "Access denied" >&2; exit 1; }\n'
+                'case "$*" in *"COUNT(*)"*) echo 2 ;; *) printf "blog\\nshop\\n" ;; esac\n',
+            )
+            write(
+                os.path.join(bindir, "mysqldump"),
+                '#!/bin/sh\n[ "$MYSQL_PWD" = pw123 ] || exit 1\n'
+                'printf "CREATE TABLE `a` (\\n);\\nCREATE TABLE `b` (\\n);\\n-- Dump completed on now\\n"\n',
+            )
             for f in ("mysql", "mysqldump"):
                 os.chmod(os.path.join(bindir, f), 0o755)
-            xml = with_dbs("<database_server><label>main</label><host>localhost</host><username>bk</username>"
-                           "<password_env>DB_PW</password_env></database_server>",
-                           BASE.replace("/tmp/x/", os.path.join(d, "out"))
-                               .replace("<folder_path>/opt/</folder_path>", "<folder_path>%s</folder_path>" % bindir)
-                               .replace("<tar_exe>/bin/tar</tar_exe>",
-                                        "<tar_exe>tar</tar_exe><status_file>%s/st.json</status_file>" % d))
+            xml = with_dbs(
+                "<database_server><label>main</label><host>localhost</host><username>bk</username>"
+                "<password_env>DB_PW</password_env></database_server>",
+                BASE.replace("/tmp/x/", os.path.join(d, "out"))
+                .replace("<folder_path>/opt/</folder_path>", "<folder_path>%s</folder_path>" % bindir)
+                .replace(
+                    "<tar_exe>/bin/tar</tar_exe>", "<tar_exe>tar</tar_exe><status_file>%s/st.json</status_file>" % d
+                ),
+            )
             cfgp = write(os.path.join(d, "c.xml"), xml)
             envp = write(os.path.join(d, ".env"), "DB_PW=pw123\n")
             old_path = os.environ["PATH"]
@@ -228,12 +303,32 @@ class DatabaseServerTests(unittest.TestCase):
                 rc = shoebox.main(["--config", cfgp, "--env", envp, "run", "--no-dropbox", "--no-email"])
             finally:
                 os.environ["PATH"] = old_path
-            st = json.load(open(os.path.join(d, "st.json")))
+            st = read_json(os.path.join(d, "st.json"))
             self.assertEqual((rc, st["errors"]), (0, 0))
-            self.assertEqual([(x["source"], x["db"], x["tables"], x["expected"]) for x in st["databases"]],
-                             [("main", "blog", 2, 2), ("main", "shop", 2, 2)])
+            self.assertEqual(
+                [(x["source"], x["db"], x["tables"], x["expected"]) for x in st["databases"]],
+                [("main", "blog", 2, 2), ("main", "shop", 2, 2)],
+            )
             self.assertTrue(os.path.exists(os.path.join(st["local_dir"], st["databases"][0]["file"])))
             self.assertTrue(st["databases"][0]["file"].endswith("-main-blog.sql.gz"))
+
+
+class DefaultConfigTests(unittest.TestCase):
+    def test_lookup_order(self):
+        old_env, old_here = os.environ.pop("SHOEBOX_CONFIG", None), shoebox.HERE
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                shoebox.HERE = d
+                self.assertEqual(shoebox.default_config(), shoebox.ETC_CONFIG)
+                write(os.path.join(d, "backupconfig.xml"), BASE)
+                self.assertEqual(shoebox.default_config(), os.path.join(d, "backupconfig.xml"))
+                os.environ["SHOEBOX_CONFIG"] = "/x/y.xml"
+                self.assertEqual(shoebox.default_config(), "/x/y.xml")
+        finally:
+            shoebox.HERE = old_here
+            os.environ.pop("SHOEBOX_CONFIG", None)
+            if old_env is not None:
+                os.environ["SHOEBOX_CONFIG"] = old_env
 
 
 class EnvTests(unittest.TestCase):
@@ -246,7 +341,8 @@ class EnvTests(unittest.TestCase):
             env = shoebox.load_env(p)
             self.assertEqual((env["A"], env["B"], env["D"]), ("1", "new", "4"))
             self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
-            self.assertIn("# c", open(p).read())
+            with open(p) as f:
+                self.assertIn("# c", f.read())
 
 
 class RetentionTests(unittest.TestCase):
@@ -271,15 +367,18 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(shoebox.plan_retention(runs, 2, 0, 0), {"2026-11-24-1600", "2026-11-23-0030"})
 
     def test_ignores_other_names_and_zero_policy(self):
-        self.assertEqual(shoebox.plan_retention(["notes", "2026-11-24-0030", "2026-11-01-0030"], 0, 0, 0),
-                         {"2026-11-24-0030"})
+        self.assertEqual(
+            shoebox.plan_retention(["notes", "2026-11-24-0030", "2026-11-01-0030"], 0, 0, 0), {"2026-11-24-0030"}
+        )
 
 
 class HashTests(unittest.TestCase):
     def test_content_hash(self):
         with tempfile.TemporaryDirectory() as d:
             empty = write(os.path.join(d, "e"), "")
-            self.assertEqual(shoebox.file_hashes(empty), (hashlib.sha256(b"").hexdigest(), hashlib.sha256(b"").hexdigest()))
+            self.assertEqual(
+                shoebox.file_hashes(empty), (hashlib.sha256(b"").hexdigest(), hashlib.sha256(b"").hexdigest())
+            )
             data = os.urandom(5 * 1024 * 1024 + 7)
             p = os.path.join(d, "f")
             with open(p, "wb") as f:
@@ -290,7 +389,10 @@ class HashTests(unittest.TestCase):
 
 
 class DumpTests(unittest.TestCase):
-    GOOD = "printf '%s\\n' '-- header' 'CREATE TABLE `a` (' ');' 'INSERT INTO a VALUES (1);' 'CREATE TABLE `b` (' ');' '-- Dump completed on 2026-11-24  0:30:01'"
+    GOOD = (
+        "printf '%s\\n' '-- header' 'CREATE TABLE `a` (' ');' 'INSERT INTO a VALUES (1);' "
+        "'CREATE TABLE `b` (' ');' '-- Dump completed on 2026-11-24  0:30:01'"
+    )
 
     def dump(self, script):
         with tempfile.TemporaryDirectory() as d:
@@ -328,18 +430,22 @@ class RunTests(unittest.TestCase):
             write(os.path.join(src, "skip", "b.txt"), "no")
             old = os.path.join(d, "out", "2020-01-01-0030")
             os.makedirs(old)
-            xml = BASE.replace("/tmp/x/", os.path.join(d, "out")) \
-                        .replace("<folder_path>/opt/</folder_path>", "<folder_path>%s</folder_path>" % src) \
-                        .replace("<folder_exclude>opt/hermes</folder_exclude>", "<folder_exclude>*/skip</folder_exclude>") \
-                        .replace("<tar_exe>/bin/tar</tar_exe>", "<tar_exe>tar</tar_exe><status_file>%s/st.json</status_file>" % d)
+            xml = (
+                BASE.replace("/tmp/x/", os.path.join(d, "out"))
+                .replace("<folder_path>/opt/</folder_path>", "<folder_path>%s</folder_path>" % src)
+                .replace("<folder_exclude>opt/hermes</folder_exclude>", "<folder_exclude>*/skip</folder_exclude>")
+                .replace(
+                    "<tar_exe>/bin/tar</tar_exe>", "<tar_exe>tar</tar_exe><status_file>%s/st.json</status_file>" % d
+                )
+            )
             cfgp = write(os.path.join(d, "c.xml"), xml)
             rc = shoebox.main(["--config", cfgp, "--env", os.path.join(d, "none"), "run", "--no-dropbox", "--no-email"])
             self.assertEqual(rc, 0)
-            st = json.load(open(os.path.join(d, "st.json")))
+            st = read_json(os.path.join(d, "st.json"))
             self.assertEqual(st["errors"], 0)
             self.assertEqual(len(st["folders"]), 1)
             run_dir = st["local_dir"]
-            man = json.load(open(os.path.join(run_dir, "manifest.json")))
+            man = read_json(os.path.join(run_dir, "manifest.json"))
             tgz = os.path.join(run_dir, man["files"][0]["file"])
             names = tarfile.open(tgz).getnames()
             self.assertTrue(any(n.endswith("keep/a.txt") for n in names))
@@ -353,8 +459,9 @@ class RunTests(unittest.TestCase):
 
     def test_dry_run_changes_nothing(self):
         with tempfile.TemporaryDirectory() as d:
-            xml = BASE.replace("/tmp/x/", os.path.join(d, "out")) \
-                        .replace("<folder_path>/opt/</folder_path>", "<folder_path>%s</folder_path>" % d)
+            xml = BASE.replace("/tmp/x/", os.path.join(d, "out")).replace(
+                "<folder_path>/opt/</folder_path>", "<folder_path>%s</folder_path>" % d
+            )
             cfgp = write(os.path.join(d, "c.xml"), xml)
             rc = shoebox.main(["--config", cfgp, "--env", os.path.join(d, "none"), "run", "--dry-run", "--no-dropbox"])
             self.assertEqual(rc, 0)

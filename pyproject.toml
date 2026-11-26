@@ -1,0 +1,8 @@
+# Lint and format settings only: Shoebox is a single script with no dependencies and is not packaged.
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I", "UP"]
+ignore = ["UP031"]  # %-formatting is used throughout on purpose
