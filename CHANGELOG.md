@@ -3,6 +3,31 @@
 All notable changes. Versions follow [semantic versioning](https://semver.org/); while the version is 0.x,
 a minor release can change the config format, and says so here.
 
+## 0.4.0 - 2026-11-26
+
+### Fixed
+
+- **A `<folder_path>` that is a symlink is now backed up.** Before, tar stored only the link, with or
+  without a trailing slash, and the run still reported OK.
+- **A `<folder_exclude>` with a trailing slash now works.** Before, tar silently ignored it.
+- **Shoebox never archives its own backups.** `<local_folder>` is left out of any folder that contains it
+  (a folder of `/` or `/var` used to pick up every earlier run), and a `<folder_path>` inside
+  `<local_folder>` is an error.
+- A second run started in the same minute stops with a clear message instead of overwriting the first.
+
+### Changed (config)
+
+- **Paths must be absolute** (`~` is expanded). Trailing and doubled slashes, `.` and `..` are tidied, so
+  `/var/www/` and `/var/www` mean the same. Exclude patterns ignore leading and trailing slashes. A
+  `<log_file>` or `<status_file>` that is a folder is an error.
+
+### Added
+
+- **Built-in log rotation:** `<log_max_kb>` (default 1024) and `<log_keep>` (default 5). No logrotate setup
+  needed.
+- Warnings when the local folder has less free space than the last run needed, and when Dropbox is over
+  90% full.
+
 ## 0.3.0 - 2026-11-26
 
 ### Changed (config)

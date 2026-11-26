@@ -35,7 +35,7 @@ import xml.etree.ElementTree as ET
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 HERE = os.path.dirname(os.path.realpath(__file__))
 RUN_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})$")  # run id, e.g. 2026-11-24-0030
 MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
@@ -51,6 +51,8 @@ VAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")  # environment variable names
 XML_ELEMENTS = {
     "shoebox": {"config", "databases", "folder_list"},
     "config": {
+        "log_max_kb",
+        "log_keep",
         "archive_label",
         "local_folder",
         "tar_exe",
@@ -184,6 +186,43 @@ def check_elements(node, path=""):
         raise ShoeboxError("unknown element <%s> in %s%s" % (child.tag, here, hint))
 
 
+def clean_path(value, what):
+    """An absolute path, tidied: ~ expanded, trailing and doubled slashes and . / .. parts removed."""
+    p = os.path.expanduser((value or "").strip())
+    if not os.path.isabs(p):
+        raise ShoeboxError("%s must be an absolute path (starting with /), got %r" % (what, value))
+    return re.sub(r"^/+", "/", os.path.normpath(p))
+
+
+def rotate_log(path, max_bytes, keep):
+    """Built-in rotation: once the log passes max_bytes, shift it to .1 (.1 to .2, ...) and keep `keep` old
+    logs. Plain text, so the old logs read like the current one."""
+    if not os.path.exists(path) or os.path.getsize(path) < max_bytes:
+        return False
+    for i in range(keep, 0, -1):
+        older = "%s.%d" % (path, i)
+        if i == keep:
+            if os.path.exists(older):
+                os.remove(older)
+        elif os.path.exists(older):
+            os.replace(older, "%s.%d" % (path, i + 1))
+    if keep:
+        os.replace(path, path + ".1")
+    else:
+        os.remove(path)
+    return True
+
+
+def clean_pattern(value):
+    """A tar exclude pattern as tar sees archive paths: no leading or trailing slash."""
+    return (value or "").strip().strip("/")
+
+
+def _inside(path, folder):
+    """True if path is folder or somewhere below it (both absolute and tidied)."""
+    return path == folder or path.startswith(folder.rstrip("/") + "/")
+
+
 class Config:
     """backupconfig.xml (what to back up, and how to reach the databases) + .env (passwords and logins)."""
 
@@ -204,14 +243,21 @@ class Config:
         self.label = _text(c, "archive_label")
         if not re.match(r"^[A-Za-z0-9_.-]+$", self.label or ""):
             raise ShoeboxError("<archive_label> must be letters, digits, _ . - (got %r)" % self.label)
-        self.local_folder = _text(c, "local_folder") or "/var/backups/shoebox"
+        self.local_folder = clean_path(_text(c, "local_folder") or "/var/backups/shoebox", "<local_folder>")
         self.tar_exe = _text(c, "tar_exe") or "tar"
         self.chunk_size = max(_int(c, "dropbox_chunksize", 32 * 1024 * 1024), 4 * 1024 * 1024)
         self.chunk_size = min(self.chunk_size // (4 * 1024 * 1024) * 4 * 1024 * 1024, 148 * 1024 * 1024)
         self.dropbox_folder = "/" + (_text(c, "dropbox_folder") or self.label).strip("/")
         self.local_keep_days = _int(c, "local_keep_days", 7)
-        self.log_file = _text(c, "log_file") or os.path.join(self.local_folder, "shoebox.log")
-        self.status_file = _text(c, "status_file") or os.path.join(self.local_folder, "status.json")
+        self.log_file = clean_path(_text(c, "log_file") or os.path.join(self.local_folder, "shoebox.log"), "<log_file>")
+        self.status_file = clean_path(
+            _text(c, "status_file") or os.path.join(self.local_folder, "status.json"), "<status_file>"
+        )
+        self.log_max_bytes = max(_int(c, "log_max_kb", 1024), 1) * 1024
+        self.log_keep = max(_int(c, "log_keep", 5), 0)
+        for tag, f in (("log_file", self.log_file), ("status_file", self.status_file)):
+            if os.path.isdir(f):
+                raise ShoeboxError("<%s> %s is a folder: give a file name, e.g. %s/%s" % (tag, f, f, tag[:-5]))
 
         # The report email: .env only (it holds a password, and differs per server)
         port = env.get("SMTP_PORT", "").strip() or "587"
@@ -260,16 +306,21 @@ class Config:
                     "each <folder> needs a <folder_path> and a <folder_label> of letters, digits, "
                     "_ . - (got label %r, path %r)" % (label, path)
                 )
+            path = clean_path(path, "<folder_path> of %s" % label)
+            if _inside(os.path.realpath(path), os.path.realpath(self.local_folder)):
+                raise ShoeboxError(
+                    "folder %s (%s) is inside <local_folder>: Shoebox would back up its own " "backups" % (label, path)
+                )
             self.folders.append(
                 {
                     "label": label,
                     "path": path,
-                    "excludes": [(e.text or "").strip() for e in f.findall("folder_exclude") if (e.text or "").strip()],
+                    "excludes": [clean_pattern(e.text) for e in f.findall("folder_exclude") if clean_pattern(e.text)],
                     "split": parse_bool(_text(f, "folder_split"), "<folder_split> of %s" % label),
                     "split_excludes": [
-                        (e.text or "").strip()
+                        clean_pattern(e.text)
                         for e in f.findall("folder_split_exclude/exclude")
-                        if (e.text or "").strip()
+                        if clean_pattern(e.text)
                     ],
                 }
             )
@@ -280,33 +331,38 @@ class Config:
         self.dropbox_refresh_token = env.get("DROPBOX_REFRESH_TOKEN", "")
 
     def folder_items(self):
-        """Expand <folder_split>: one archive per sub-folder (minus split excludes), plus one for the files
-        sitting directly in the split folder."""
+        """The archives to make. Expands <folder_split> (one archive per sub-folder, minus split excludes, plus
+        one for the files sitting directly in the folder), follows a <folder_path> that is a symlink (tar would
+        otherwise store just the link), and keeps <local_folder> out of every archive."""
+        local = os.path.realpath(self.local_folder)
         items = []
+
+        def add(label, path, excludes, files=None):
+            real = os.path.realpath(path) if os.path.isdir(path) else path
+            ex = list(excludes)
+            if real != path:  # excludes written against the link's path follow it to the real one
+                old, new = path.strip("/"), real.strip("/")
+                ex = [new + e[len(old) :] if e == old or e.startswith(old + "/") else e for e in ex]
+            if files is None and _inside(local, real):
+                ex.append(local.strip("/"))
+            items.append({"label": label, "path": real, "given": path, "excludes": ex, "files": files})
+
         for f in self.folders:
-            if not f["split"]:
-                items.append({"label": f["label"], "path": f["path"], "excludes": f["excludes"], "files": None})
-                continue
-            if not os.path.isdir(f["path"]):
-                items.append({"label": f["label"], "path": f["path"], "excludes": f["excludes"], "files": None})
+            if not f["split"] or not os.path.isdir(f["path"]):
+                add(f["label"], f["path"], f["excludes"])
                 continue
             loose = []
             for entry in sorted(os.listdir(f["path"])):
                 full = os.path.join(f["path"], entry)
+                if entry in f["split_excludes"]:
+                    continue
                 if os.path.isdir(full) and not os.path.islink(full):
-                    if entry not in f["split_excludes"]:
-                        items.append(
-                            {
-                                "label": "%s-%s" % (f["label"], entry),
-                                "path": full,
-                                "excludes": f["excludes"],
-                                "files": None,
-                            }
-                        )
-                elif entry not in f["split_excludes"]:
+                    if not _inside(os.path.realpath(full), local):  # never archive the backups themselves
+                        add("%s-%s" % (f["label"], entry), full, f["excludes"])
+                else:
                     loose.append(entry)
             if loose:
-                items.append({"label": "%s-_top" % f["label"], "path": f["path"], "excludes": [], "files": loose})
+                add("%s-_top" % f["label"], f["path"], [], loose)
         return items
 
 
@@ -768,6 +824,8 @@ class Run:
                 rec["rc"], rec["detail"] = "dry-run", "would archive"
                 self.log("dry-run: would archive %s -> %s" % (it["path"], fname))
                 continue
+            if it["given"] != it["path"]:
+                self.log("NOTE folder %s: %s is a link, archiving %s" % (it["label"], it["given"], it["path"]))
             cmd = [self.cfg.tar_exe, "--create", "--gzip", "--file", out, "--warning=no-file-changed"]
             cmd += ["--exclude=%s" % e for e in it["excludes"]]
             if it["files"]:
@@ -920,6 +978,19 @@ class Run:
                 if m[".tag"] == "folder" and MONTH_RE.match(m["name"]) and not dbx.list_folder(m["path_lower"]):
                     dbx.delete(m["path_display"])
 
+    def check_local_space(self):
+        """Warn when the local folder has less free space than the last run needed (plus 20%)."""
+        try:
+            with open(self.cfg.status_file) as f:
+                last = int(json.load(f).get("size_bytes") or 0)
+            free = shutil.disk_usage(self.cfg.local_folder).free
+        except (OSError, ValueError, AttributeError):
+            return
+        if last and free < last * 1.2:
+            self.warnings.append(
+                "only %s free in %s; the last run was %s" % (human(free), self.cfg.local_folder, human(last))
+            )
+
     def prune_local(self):
         cutoff = self.started - dt.timedelta(days=self.cfg.local_keep_days)
         removed = []
@@ -952,9 +1023,16 @@ class Run:
 
     def _execute(self):
         a = self.args
+        if not a.dry_run and os.path.exists(self.local_dir):
+            raise ShoeboxError(
+                "run %s already exists in %s: wait a minute and run again" % (self.run_id, self.cfg.local_folder)
+            )
         os.makedirs(self.cfg.local_folder, mode=0o700, exist_ok=True)
         os.makedirs(os.path.dirname(self.cfg.log_file) or ".", exist_ok=True)
+        rotated = rotate_log(self.cfg.log_file, self.cfg.log_max_bytes, self.cfg.log_keep)
         self.logf = open(self.cfg.log_file, "a")
+        if rotated:
+            self.log("log rotated: the previous log is %s.1" % self.cfg.log_file)
         self.log(
             "===== shoebox %s run %s (%s)%s" % (VERSION, self.run_id, self.cfg.label, " DRY RUN" if a.dry_run else "")
         )
@@ -962,6 +1040,7 @@ class Run:
             self.log("WARN " + w)
         if not a.dry_run:
             os.makedirs(self.local_dir, mode=0o700, exist_ok=True)
+        self.check_local_space()
         if not a.no_folders:
             self.do_folders()
         if not a.no_mysql:
@@ -986,6 +1065,11 @@ class Run:
                 else:
                     self.retention = {"policy": "skipped: this run had errors", "deleted": [], "kept": None}
                 self.dropbox_space = dbx.space()
+                used, alloc = self.dropbox_space
+                if used and alloc and used > alloc * 0.9:
+                    self.warnings.append(
+                        "Dropbox is %.0f%% full (%s of %s)" % (used * 100.0 / alloc, human(used), human(alloc))
+                    )
             except ShoeboxError as e:
                 self.fail("Dropbox retention/space: %s" % e)
         try:
@@ -1339,7 +1423,7 @@ def cmd_check(cfg, args):
             % (
                 "ok" if ok else "MISSING",
                 it["label"],
-                it["path"],
+                it["path"] if it["given"] == it["path"] else "%s -> %s" % (it["given"], it["path"]),
                 "  (excl %s)" % ", ".join(it["excludes"]) if it["excludes"] else "",
             )
         )

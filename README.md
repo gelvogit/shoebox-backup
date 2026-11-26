@@ -35,7 +35,7 @@ own for a small server.
 - [Connect Dropbox](#connect-dropbox)
 - [Configure](#configure): [general](#general-settings), [folders](#folders), [databases](#databases),
   [retention](#retention), [email report](#email-report)
-- [First run and scheduling](#first-run-and-scheduling)
+- [First run and scheduling](#first-run-and-scheduling), [logs](#logs)
 - [Commands](#commands)
 - [What a backup looks like](#what-a-backup-looks-like): [layout](#layout), [file names](#file-names),
   [manifest](#manifestjson)
@@ -142,6 +142,9 @@ option with comments. Shoebox refuses XML elements it does not know, so a typo s
 instead of silently switching an option off. Yes/no values accept `yes`/`no`, `true`/`false`, `y`/`n` or
 `1`/`0`.
 
+Paths must be absolute (start with `/`; `~` is expanded). A trailing slash makes no difference, and doubled
+slashes or `.` and `..` parts are tidied up, so `/var/www/html/` and `/var/www/html` mean the same.
+
 After any change, run `shoebox check`.
 
 ### General settings
@@ -153,7 +156,9 @@ Inside `<config>`:
 | `archive_label` | required | A name for this server, used in every file name and as the Dropbox folder. Letters, digits, `_ . -` |
 | `local_folder` | `/var/backups/shoebox` | Where each run is written before upload (one sub-folder per run) |
 | `local_keep_days` | `7` | Local runs older than this are deleted after each run |
-| `log_file` | `<local_folder>/shoebox.log` | Appended to on every run |
+| `log_file` | `<local_folder>/shoebox.log` | Appended to on every run, and rotated by Shoebox itself (see [Logs](#logs)) |
+| `log_max_kb` | `1024` | Rotate the log when it passes this size (about a year of nightly runs) |
+| `log_keep` | `5` | How many old logs to keep (`shoebox.log.1` is the newest) |
 | `status_file` | `<local_folder>/status.json` | The last run's result, for [monitoring](#monitoring) |
 | `dropbox_folder` | `archive_label` | Folder inside the Dropbox app folder |
 | `dropbox_chunksize` | `33554432` (32 MiB) | Upload chunk size in bytes; rounded to 4 MiB steps, max 148 MiB |
@@ -184,18 +189,22 @@ Each `<folder>` in `<folder_list>` becomes one archive (or one per sub-folder wh
 ```
 
 - `folder_label` (required) names the archive. Letters, digits, `_ . -`.
-- `folder_path` (required) is the folder to archive. A missing folder is an error in the report.
+- `folder_path` (required) is the folder to archive. A missing folder is an error in the report. If the
+  path is a symlink to a folder, Shoebox archives the folder it points to (tar alone would store just the
+  link), and the archive holds the real path.
 - `folder_split` (default `no`): one archive per sub-folder, labelled `<folder_label>-<sub-folder>`, plus a
   `<folder_label>-_top` archive for the files sitting directly in the folder. Handy for `/var/www` or
   `/home`, where each site or user is then its own small file to restore. New sub-folders are picked up
   automatically.
 - `folder_split_exclude`: sub-folder names (exact, not patterns) that a split skips.
-- `folder_exclude` (repeatable): a GNU tar `--exclude` pattern. Archive paths have no leading `/`, so write
-  `opt/big-thing`, not `/opt/big-thing`. Patterns like `*.log` match anywhere. Exclude anything that holds
-  secrets you do not want in Dropbox, such as the folder with Shoebox's own `.env` if it is not in `/etc`.
+- `folder_exclude` (repeatable): a GNU tar `--exclude` pattern, matched against archive paths, which have no
+  leading `/`. Leading and trailing slashes are ignored, so `/opt/big-thing/` works the same as
+  `opt/big-thing`. Patterns like `*.log` match anywhere. Exclude anything that holds secrets you do not want
+  in Dropbox, such as the folder with Shoebox's own `.env` if it is not in `/etc`.
 
-Files that change while being archived (logs, for example) give a warning, not an error: the archive is still
-kept.
+Shoebox never archives its own backups: `local_folder` is left out of any folder that contains it (even `/`),
+and a `folder_path` inside `local_folder` is an error. Symlinks inside a folder are stored as links. Files
+that change while being archived (logs, for example) give a warning, not an error: the archive is still kept.
 
 ### Databases
 
@@ -342,17 +351,13 @@ WantedBy=timers.target
 sudo systemctl daemon-reload && sudo systemctl enable --now shoebox.timer
 ```
 
-The log file grows by a few KB a run. To rotate it, `/etc/logrotate.d/shoebox`:
+### Logs
 
-```
-/var/log/shoebox/shoebox.log {
-    monthly
-    rotate 12
-    compress
-    missingok
-    notifempty
-}
-```
+Each run appends a few KB to `log_file`: every folder, dump and upload with its size and time, then any
+warnings and errors. Shoebox rotates the log itself at the start of a run once it passes `log_max_kb`
+(default 1 MB, about a year of nightly runs), keeping `log_keep` old logs (default 5) as `shoebox.log.1`,
+`shoebox.log.2` and so on. No logrotate setup is needed; if you prefer logrotate, set `log_max_kb` high and
+let it do the job.
 
 ## Commands
 
@@ -487,6 +492,9 @@ Besides the email, every run (except `--dry-run`) writes `status_file`, a JSON f
 | `retention`, `dropbox_used`, `dropbox_allocated` | What retention did, and Dropbox space |
 | `local_dir`, `dropbox_dir`, `log`, `label`, `host`, `shoebox` | Where things are, and the version |
 
+Shoebox also warns in the report when the local folder has less free space than the last run needed, and
+when Dropbox is more than 90% full.
+
 A check you can run from another job or a monitoring agent (needs `jq`):
 
 ```sh
@@ -521,6 +529,9 @@ S=/var/log/shoebox/status.json
 | `N CREATE TABLE lines, database has M tables` | The dump stopped early or a table could not be read. Look at the `.failed` file and the error in the log |
 | `Access denied` | Check the username, the password variable and the grants above |
 | `another shoebox run for X is still going` | A run is still going (or hung): see `pgrep -af shoebox` |
+| `run ... already exists` | Two runs started in the same minute; wait a minute |
+| `must be an absolute path` | Start the path with `/` |
+| `is inside <local_folder>` | A folder to back up is inside the local backup folder: move one of them |
 | `tar exit 2` | A folder could not be read: permissions, or the path is not a folder |
 | No email | `shoebox check` shows the email settings; try `run --no-dropbox --only ETC` to send a quick test |
 

@@ -6,6 +6,7 @@
   passwords: those, the report email settings and the Dropbox login live in .env (see .env.example).
   Shoebox refuses elements it does not know, so a typo is an error, not a silently ignored option.
   Yes/no values accept yes/no, true/false, y/n or 1/0.
+  Paths must be absolute; a trailing slash makes no difference.
 -->
 <shoebox>
 	<config>
@@ -13,6 +14,8 @@
 		<local_folder>/var/backups/shoebox</local_folder>  <!-- default /var/backups/shoebox. One sub-folder per run -->
 		<local_keep_days>7</local_keep_days>             <!-- default 7. Local runs older than this are removed -->
 		<log_file>/var/log/shoebox/shoebox.log</log_file>        <!-- default: local_folder/shoebox.log -->
+		<log_max_kb>1024</log_max_kb>                    <!-- default 1024. Shoebox rotates the log past this size -->
+		<log_keep>5</log_keep>                           <!-- default 5. Old logs kept: shoebox.log.1 ... .5 -->
 		<status_file>/var/log/shoebox/status.json</status_file>  <!-- default: local_folder/status.json. The last run, for monitoring -->
 		<dropbox_folder>MYSERVER</dropbox_folder>        <!-- default: archive_label. Folder inside the Dropbox app folder -->
 		<dropbox_chunksize>33554432</dropbox_chunksize>  <!-- default 32 MiB. Upload chunk in bytes (4 MiB steps, max 148 MiB) -->

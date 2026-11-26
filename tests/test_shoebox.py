@@ -313,6 +313,146 @@ class DatabaseServerTests(unittest.TestCase):
             self.assertTrue(st["databases"][0]["file"].endswith("-main-blog.sql.gz"))
 
 
+class PathTests(unittest.TestCase):
+    """Paths in the XML work with or without a trailing slash, through symlinks, and never loop."""
+
+    def make(self, d, folders, local=None):
+        xml = """<shoebox><config><archive_label>BOX</archive_label><local_folder>%s</local_folder></config>
+            <folder_list>%s</folder_list></shoebox>""" % (local or os.path.join(d, "out"), folders)
+        return write(os.path.join(d, "c.xml"), xml)
+
+    def members(self, d, label):
+        run = [e for e in os.listdir(os.path.join(d, "out")) if shoebox.RUN_RE.match(e)][0]
+        name = [f for f in os.listdir(os.path.join(d, "out", run)) if "-%s-dir" % label in f][0]
+        with tarfile.open(os.path.join(d, "out", run, name)) as t:
+            return sorted(m.name for m in t.getmembers())
+
+    def backup(self, cfgp):
+        return shoebox.main(["-c", cfgp, "--env", "/nonexistent", "run", "--no-dropbox", "--no-email"])
+
+    def test_tidy_paths(self):
+        self.assertEqual(shoebox.clean_path(" /var//www/html/ ", "x"), "/var/www/html")
+        self.assertEqual(shoebox.clean_path("//srv/./a/../b", "x"), "/srv/b")
+        self.assertEqual(shoebox.clean_path("~/x", "x"), os.path.join(os.path.expanduser("~"), "x"))
+        with self.assertRaises(shoebox.ShoeboxError) as e:
+            shoebox.clean_path("var/www", "<folder_path> of WWW")
+        self.assertIn("must be an absolute path", str(e.exception))
+        self.assertEqual(shoebox.clean_pattern(" /opt/big/ "), "opt/big")
+
+    def test_trailing_slash_makes_no_difference(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "src", "big"))
+            write(os.path.join(d, "src", "a.txt"), "a")
+            write(os.path.join(d, "src", "big", "b.txt"), "b")
+            src = os.path.join(d, "src")
+            folders = (
+                "<folder><folder_label>A</folder_label><folder_path>%s</folder_path>"
+                "<folder_exclude>%s/big/</folder_exclude></folder>"
+                "<folder><folder_label>B</folder_label><folder_path>%s//</folder_path>"
+                "<folder_exclude>/%s/big</folder_exclude></folder>" % (src, src.strip("/"), src, src.strip("/"))
+            )
+            self.assertEqual(self.backup(self.make(d, folders)), 0)
+            a, b = self.members(d, "A"), self.members(d, "B")
+            self.assertEqual(a, b)
+            self.assertIn(src.strip("/") + "/a.txt", a)
+            self.assertFalse([m for m in a if "big" in m])
+
+    def test_symlinked_folder_is_followed(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "real", "skip"))
+            write(os.path.join(d, "real", "a.txt"), "a")
+            write(os.path.join(d, "real", "skip", "s.txt"), "s")
+            link = os.path.join(d, "link")
+            os.symlink(os.path.join(d, "real"), link)
+            folders = (
+                "<folder><folder_label>L</folder_label><folder_path>%s/</folder_path>"
+                "<folder_exclude>%s/skip</folder_exclude></folder>" % (link, link.strip("/"))
+            )
+            self.assertEqual(self.backup(self.make(d, folders)), 0)
+            m = self.members(d, "L")
+            real = os.path.realpath(os.path.join(d, "real")).strip("/")
+            self.assertIn(real + "/a.txt", m)
+            self.assertFalse([x for x in m if "skip" in x])
+
+    def test_local_folder_is_never_archived(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "site"))
+            write(os.path.join(d, "site", "i.html"), "x")
+            folders = "<folder><folder_label>ALL</folder_label><folder_path>%s</folder_path></folder>" % d
+            self.assertEqual(self.backup(self.make(d, folders)), 0)
+            self.assertFalse([m for m in self.members(d, "ALL") if "/out" in m])
+            split = folders.replace("</folder_path>", "</folder_path><folder_split>yes</folder_split>")
+            cfg = shoebox.Config(self.make(d, split), {})
+            self.assertEqual([i["label"] for i in cfg.folder_items()], ["ALL-site", "ALL-_top"])
+            inside = "<folder><folder_label>X</folder_label><folder_path>%s/out/sub</folder_path></folder>" % d
+            with self.assertRaises(shoebox.ShoeboxError) as e:
+                shoebox.Config(self.make(d, inside), {})
+            self.assertIn("inside <local_folder>", str(e.exception))
+
+    def test_bad_paths(self):
+        with tempfile.TemporaryDirectory() as d:
+            rel = "<folder><folder_label>R</folder_label><folder_path>var/www</folder_path></folder>"
+            with self.assertRaises(shoebox.ShoeboxError):
+                shoebox.Config(self.make(d, rel), {})
+            xml = BASE.replace("</config>", "<log_file>%s</log_file></config>" % d)
+            with self.assertRaises(shoebox.ShoeboxError) as e:
+                shoebox.Config(write(os.path.join(d, "c.xml"), xml), {})
+            self.assertIn("is a folder", str(e.exception))
+
+    def test_second_run_in_the_same_minute_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "src"))
+            cfgp = self.make(d, "<folder><folder_label>S</folder_label><folder_path>%s/src</folder_path></folder>" % d)
+            cfg = shoebox.Config(cfgp, {})
+            args = shoebox.argparse.Namespace(
+                dry_run=False, only=None, no_folders=False, no_mysql=True, no_dropbox=True, no_email=True, email_to=None
+            )
+            r = shoebox.Run(cfg, args)
+            os.makedirs(r.local_dir)
+            with self.assertRaises(shoebox.ShoeboxError) as e:
+                r.execute()
+            self.assertIn("already exists", str(e.exception))
+
+
+class LogRotationTests(unittest.TestCase):
+    def test_rotate_keeps_n(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "shoebox.log")
+            for i in range(5):
+                write(log, "run %d\n" % i + "x" * 100)
+                self.assertTrue(shoebox.rotate_log(log, 50, 3))
+            self.assertEqual(sorted(os.listdir(d)), ["shoebox.log.1", "shoebox.log.2", "shoebox.log.3"])
+            with open(log + ".1") as f:
+                self.assertTrue(f.read().startswith("run 4"))
+            with open(log + ".3") as f:
+                self.assertTrue(f.read().startswith("run 2"))
+            write(log, "small")
+            self.assertFalse(shoebox.rotate_log(log, 50, 3))
+            write(log, "x" * 100)
+            self.assertTrue(shoebox.rotate_log(log, 50, 0))
+            self.assertFalse(os.path.exists(log))
+
+    def test_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            xml = BASE.replace("</config>", "<log_max_kb>2048</log_max_kb><log_keep>3</log_keep></config>")
+            cfg = shoebox.Config(write(os.path.join(d, "c.xml"), xml), {})
+        self.assertEqual((cfg.log_max_bytes, cfg.log_keep), (2048 * 1024, 3))
+
+
+class SpaceTests(unittest.TestCase):
+    def test_low_local_space_warns(self):
+        with tempfile.TemporaryDirectory() as d:
+            xml = BASE.replace("/tmp/x/", d).replace("</config>", "<status_file>%s/st.json</status_file></config>" % d)
+            cfg = shoebox.Config(write(os.path.join(d, "c.xml"), xml), {})
+            r = shoebox.Run(cfg, None)
+            write(os.path.join(d, "st.json"), json.dumps({"size_bytes": 1}))
+            r.check_local_space()
+            self.assertEqual(r.warnings, [])
+            write(os.path.join(d, "st.json"), json.dumps({"size_bytes": 10**18}))
+            r.check_local_space()
+            self.assertIn("free in", r.warnings[0])
+
+
 class DefaultConfigTests(unittest.TestCase):
     def test_lookup_order(self):
         old_env, old_here = os.environ.pop("SHOEBOX_CONFIG", None), shoebox.HERE
