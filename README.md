@@ -10,8 +10,7 @@ Website: <https://gelvogit.github.io/shoebox-backup/>
 
 Like a shoebox of photos: no key, no special tool, just open the lid. Folders become `.tgz` files and
 databases become `.sql.gz` files that open with `tar` and `zcat` on any machine, years from now, without
-Shoebox. Use it as a small server's backup, or as a second copy you can always read alongside another
-backup tool.
+Shoebox. Easy, reliable and simple.
 
 - **One file, no dependencies.** `shoebox.py` needs only Python 3.8+ and its standard library. No pip.
 - **Any MySQL/MariaDB server.** On this machine, on another host, or in a Docker container (dumped inside the
