@@ -857,11 +857,16 @@ def report_text(st):
 
 
 GREEN, RED, AMBER, GREY = "#1a7f37", "#cf222e", "#9a6700", "#57606a"
-TD = 'style="padding:6px 10px;border-bottom:1px solid #eaeef2;vertical-align:top"'
+TD = 'style="padding:6px 10px;border-bottom:1px solid #eaeef2;vertical-align:top;word-break:break-word;overflow-wrap:anywhere"'
 TH = ('style="padding:6px 10px;border-bottom:2px solid #d0d7de;text-align:left;font-size:14px;color:#57606a;'
-      'text-transform:uppercase;letter-spacing:.04em"')
+      'text-transform:uppercase;letter-spacing:.04em;white-space:nowrap"')
 TDR = 'style="padding:6px 10px;border-bottom:1px solid #eaeef2;vertical-align:top;text-align:right;white-space:nowrap"'
 esc = html.escape
+
+
+def _code(text):
+    """Monospace text; the empty spans around dots stop mail clients turning names like site.com into links."""
+    return '<code style="font-size:15px">%s</code>' % esc(str(text)).replace(".", "<span>.</span>")
 
 
 def _pill(colour, text):
@@ -899,7 +904,7 @@ def report_html(st):
     errors = st["errors"]
     banner_c = GREEN if errors == 0 else RED
     banner_t = "&#10004; Backup OK" if errors == 0 else "&#10008; %d error%s" % (errors, "" if errors == 1 else "s")
-    p = ['<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:760px;margin:0 auto;color:#24292f">',
+    p = ['<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:1200px;margin:0 auto;color:#24292f">',
          '<div style="background:%s;color:#fff;padding:16px 20px;border-radius:8px 8px 0 0">'
          '<div style="font-size:15px;opacity:.9">%s &middot; Shoebox &middot; %s</div>'
          '<div style="font-size:25px;font-weight:700">%s</div></div>' % (banner_c, esc(st["label"]), esc(st["started"]), banner_t),
@@ -916,12 +921,12 @@ def report_html(st):
         _tile("Uploaded", "%d / %d" % (ok, len(st["uploads"])), space or "checksums verified"),
         _tile("Duration", dur(st["duration_s"]), "%s to %s" % (st["started"][11:16], st["finished"][11:16]))))
     if st["folders"]:
-        rows = [["<code>%s</code>" % esc(f["label"]), _badge(f["rc"]), "<code>%s</code>" % esc(f["path"]),
+        rows = [[_code(f["label"]), _badge(f["rc"]), _code(f["path"]),
                  human(f["bytes"]), dur(f["secs"])] for f in st["folders"]]
         p.append(_section("Folders", _table(["Archive", "Result", "Path", "Size", "Time"], rows, right=(3, 4)),
                           "Each folder is a plain <code>.tgz</code>: open it with any archive tool."))
     if st["databases"]:
-        rows = [["<code>%s/%s</code>" % (esc(d["source"]), esc(d["db"])), _badge(d["rc"]),
+        rows = [[_code("%s/%s" % (d["source"], d["db"])), _badge(d["rc"]),
                  "%s / %s" % (d.get("tables"), d.get("expected")), human(d.get("bytes")), dur(d.get("secs")),
                  esc(d.get("problem", ""))] for d in st["databases"]]
         p.append(_section("Databases", _table(["Database", "Result", "Tables", "Size", "Time", ""], rows, right=(2, 3, 4)),
@@ -929,8 +934,8 @@ def report_html(st):
                           "<code>-- Dump completed</code> and has as many tables as the database."))
     bad = [u for u in st["uploads"] if not u["ok"]]
     note = "Every file was checked against Dropbox's content hash after upload." if not bad else ""
-    rows = [["<code>%s</code>" % esc(u["file"]), _badge(u["ok"]), esc(u["detail"])] for u in bad] or \
-           [["%d files to <code>%s</code>" % (ok, esc(st["dropbox_dir"])), _badge(True), ""]]
+    rows = [[_code(u["file"]), _badge(u["ok"]), esc(u["detail"])] for u in bad] or \
+           [["%d files to %s" % (ok, _code(st["dropbox_dir"])), _badge(True), ""]]
     p.append(_section("Dropbox", _table(["Files", "Result", ""], rows), note))
     r = st.get("retention") or {}
     if r:
