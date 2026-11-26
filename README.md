@@ -10,8 +10,8 @@ Website: <https://gelvogit.github.io/shoebox-backup/>
 
 Like a shoebox of photos: no key, no special tool, just open the lid. Folders become `.tgz` files and
 databases become `.sql.gz` files that open with `tar` and `zcat` on any machine, years from now, without
-Shoebox. Use it next to a "real" backup tool (restic, Borg, ...) as the copy you can always read, or on its
-own for a small server.
+Shoebox. Use it as a small server's backup, or as a second copy you can always read alongside another
+backup tool.
 
 - **One file, no dependencies.** `shoebox.py` needs only Python 3.8+ and its standard library. No pip.
 - **Any MySQL/MariaDB server.** On this machine, on another host, or in a Docker container (dumped inside the
@@ -56,15 +56,15 @@ Good fits:
   off the machine and an email that says it worked.
 - **A Docker host** running MySQL or MariaDB containers: each container is dumped with its own credentials,
   without installing database tools on the host or opening ports.
-- **A second, readable copy next to an encrypted backup tool.** restic and Borg are excellent, but you need
-  the tool and the key to get anything back. Shoebox's copy opens with `tar` and `zcat`.
+- **A second, readable copy next to an encrypted backup tool.** With encrypted backups you need the tool
+  and the key to get anything back. Shoebox's copy opens with `tar` and `zcat`.
 
 Not a good fit:
 
 - **Data that must be encrypted at rest.** Shoebox does not encrypt. Anyone who can open the Dropbox app
   folder can read the backups (see [Security](#security)).
 - **Very large or fast-changing data.** Every run is a full copy: nothing is deduplicated or incremental. A
-  few GB a night is comfortable; hundreds of GB is a job for restic or Borg.
+  few GB a night is comfortable; hundreds of GB needs a tool with incremental, deduplicated backups.
 - **Other storage or databases.** Dropbox only; MySQL and MariaDB only (no PostgreSQL yet). Linux only.
 
 ## Requirements

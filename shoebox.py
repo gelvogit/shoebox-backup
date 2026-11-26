@@ -3,8 +3,8 @@
 
 Everything Shoebox writes can be opened without Shoebox: folders become .tgz files, databases become
 .sql.gz files, and each run has a manifest.json with sizes and SHA-256 sums. No encryption, no
-deduplication, no special format: it is meant to sit next to a "real" backup tool as the copy you can
-always read.
+deduplication, no special format: a backup you can always read, on its own or as a second copy
+alongside another backup tool.
 
 Python 3.8+, standard library only. Run `shoebox.py --help`.
 """
@@ -418,7 +418,7 @@ def run_time(run_id):
 
 def plan_retention(run_ids, daily, weekly, monthly):
     """Return the run ids to keep: the newest run of each of the last `daily` days, `weekly` ISO weeks and
-    `monthly` months that have runs (the restic/GFS rule). The newest run is always kept."""
+    `monthly` months that have runs (grandfather-father-son). The newest run is always kept."""
     runs = sorted((r for r in run_ids if RUN_RE.match(r)), reverse=True)
     keep = set(runs[:1])
     for n, key in (
