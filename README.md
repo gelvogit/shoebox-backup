@@ -6,6 +6,8 @@
 
 **Plain, verified nightly backups of folders and MySQL/MariaDB databases to Dropbox.**
 
+Website: <https://gelvogit.github.io/shoebox-backup/>
+
 Like a shoebox of photos: no key, no special tool, just open the lid. Folders become `.tgz` files and
 databases become `.sql.gz` files that open with `tar` and `zcat` on any machine, years from now, without
 Shoebox. Use it next to a "real" backup tool (restic, Borg, ...) as the copy you can always read, or on its
