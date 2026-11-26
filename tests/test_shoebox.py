@@ -190,6 +190,10 @@ class DatabaseServerTests(unittest.TestCase):
         self.assertNotIn("MYSQL_PWD", sock._env())
         self.assertTrue(nopw.dump_cmd("x")[5].startswith("unset MYSQL_PWD; "))
 
+    def test_old_env_keys_warn(self):
+        cfg = self.cfg("", {"MYSQL_HOST": "x", "MYSQL_PASSWORD": "y"})
+        self.assertTrue(any("MYSQL_HOST, MYSQL_PASSWORD in .env is no longer used" in w for w in cfg.warnings))
+
     def test_missing_env_password_fails_only_that_server(self):
         srv = self.cfg("<database_server><label>a</label><host>h</host><username>u</username>"
                        "<password_env>NOPE</password_env></database_server>").db_servers[0]

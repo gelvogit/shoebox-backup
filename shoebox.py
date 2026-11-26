@@ -169,6 +169,10 @@ class Config:
         if old:
             raise ShoeboxError("<%s> is the old database format: list each server as a <database_server> "
                                "inside <databases> (see backupconfig.example.xml)" % ">, <".join(old))
+        stale = [k for k in ("MYSQL_HOST", "MYSQL_USERNAME", "MYSQL_PASSWORD") if k in env]
+        if stale:
+            self.warnings.append("%s in .env is no longer used: give each <database_server> its <host>, "
+                                 "<username> and <password_env>" % ", ".join(stale))
         dbs = root.find("databases")
         self.db_servers = [DbServer(n, i, env, self.warnings)
                            for i, n in enumerate(dbs.findall("database_server") if dbs is not None else [], 1)]
