@@ -3,6 +3,19 @@
 All notable changes. Versions follow [semantic versioning](https://semver.org/); while the version is 0.x,
 a minor release can change the config format, and says so here.
 
+## 0.5.0 - 2026-11-27
+
+### Added
+
+- **`<global_exclude>`** in `<config>` (repeatable): a tar exclude pattern applied to every folder. For
+  example `<global_exclude>.env</global_exclude>` keeps every `.env` file, at any depth, out of every archive.
+  The README has a "Keep secrets out" section.
+
+### Fixed
+
+- With `<folder_split>`, the `-_top` archive (files sitting directly in the folder) now gets the folder's
+  `<folder_exclude>` patterns too. Before, it ignored them.
+
 ## 0.4.0 - 2026-11-26
 
 ### Fixed

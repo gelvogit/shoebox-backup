@@ -35,7 +35,7 @@ import xml.etree.ElementTree as ET
 from email.message import EmailMessage
 from email.utils import formataddr, formatdate
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 HERE = os.path.dirname(os.path.realpath(__file__))
 RUN_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})-(\d{2})(\d{2})$")  # run id, e.g. 2026-11-24-0030
 MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
@@ -62,6 +62,7 @@ XML_ELEMENTS = {
         "status_file",
         "dropbox_folder",
         "retention",
+        "global_exclude",
     },
     "retention": {"daily", "weekly", "monthly"},
     "databases": {"database_server"},
@@ -255,6 +256,8 @@ class Config:
         )
         self.log_max_bytes = max(_int(c, "log_max_kb", 1024), 1) * 1024
         self.log_keep = max(_int(c, "log_keep", 5), 0)
+        # tar exclude patterns for every folder archive, e.g. ".env" (a name without a slash matches at any depth)
+        self.global_excludes = [clean_pattern(e.text) for e in c.findall("global_exclude") if clean_pattern(e.text)]
         for tag, f in (("log_file", self.log_file), ("status_file", self.status_file)):
             if os.path.isdir(f):
                 raise ShoeboxError("<%s> %s is a folder: give a file name, e.g. %s/%s" % (tag, f, f, tag[:-5]))
@@ -349,7 +352,7 @@ class Config:
 
         for f in self.folders:
             if not f["split"] or not os.path.isdir(f["path"]):
-                add(f["label"], f["path"], f["excludes"])
+                add(f["label"], f["path"], f["excludes"] + self.global_excludes)
                 continue
             loose = []
             for entry in sorted(os.listdir(f["path"])):
@@ -358,11 +361,12 @@ class Config:
                     continue
                 if os.path.isdir(full) and not os.path.islink(full):
                     if not _inside(os.path.realpath(full), local):  # never archive the backups themselves
-                        add("%s-%s" % (f["label"], entry), full, f["excludes"])
+                        add("%s-%s" % (f["label"], entry), full, f["excludes"] + self.global_excludes)
                 else:
                     loose.append(entry)
             if loose:
-                add("%s-_top" % f["label"], f["path"], [], loose)
+                # tar matches an exclude against the named files too, so a loose .env is dropped here as well
+                add("%s-_top" % f["label"], f["path"], f["excludes"] + self.global_excludes, loose)
         return items
 
 

@@ -357,6 +357,26 @@ class PathTests(unittest.TestCase):
             self.assertIn(src.strip("/") + "/a.txt", a)
             self.assertFalse([m for m in a if "big" in m])
 
+    def test_global_exclude_drops_env_files_everywhere(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "src")
+            os.makedirs(os.path.join(src, "site", "deep"))
+            for rel in (".env", "keep.txt", "site/.env", "site/.env.bak-1", "site/deep/.env-live", "site/app.php"):
+                write(os.path.join(src, rel), "x")
+            xml = """<shoebox><config><archive_label>BOX</archive_label><local_folder>%s</local_folder>
+                <global_exclude>.env</global_exclude><global_exclude>.env.*</global_exclude>
+                <global_exclude>/.env-*/</global_exclude></config><folder_list>
+                <folder><folder_label>ALL</folder_label><folder_path>%s</folder_path></folder>
+                <folder><folder_label>SPLIT</folder_label><folder_path>%s</folder_path><folder_split>y</folder_split>
+                </folder></folder_list></shoebox>""" % (os.path.join(d, "out"), src, src)
+            self.assertEqual(self.backup(write(os.path.join(d, "c.xml"), xml)), 0)
+            for label in ("ALL", "SPLIT-site", "SPLIT-_top"):
+                m = self.members(d, label)
+                self.assertTrue(m, label)
+                self.assertFalse([x for x in m if "/.env" in "/" + x], "%s: %s" % (label, m))
+            self.assertIn("keep.txt", self.members(d, "SPLIT-_top"))
+            self.assertIn(src.strip("/") + "/site/app.php", self.members(d, "SPLIT-site"))
+
     def test_symlinked_folder_is_followed(self):
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, "real", "skip"))

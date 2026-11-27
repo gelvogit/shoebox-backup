@@ -240,7 +240,7 @@ footer a { color: var(--muted); }
         <div class="feature"><h3>Dumps that are checked</h3><p>A dump only counts if <code>mysqldump</code> exits cleanly, the file ends with <code>-- Dump completed</code>, and it has one <code>CREATE TABLE</code> for every table. <code>--force</code> is never used.</p></div>
         <div class="feature"><h3>Uploads that are verified</h3><p>Every file is compared with Dropbox's own <code>content_hash</code> after upload. Big files go up in chunks, with retries.</p></div>
         <div class="feature"><h3>Any MySQL or MariaDB</h3><p>On this machine, another host, or inside a Docker container. Each server has its own login and databases; nothing is assumed.</p></div>
-        <div class="feature"><h3>No secrets on show</h3><p>Passwords live in a root-only <code>.env</code> and reach the database through the environment, never the XML or a command line.</p></div>
+        <div class="feature"><h3>No secrets on show</h3><p>Passwords live in a root-only <code>.env</code> and reach the database through the environment, never the XML or a command line. One line keeps app <code>.env</code> files out of the archives.</p></div>
         <div class="feature"><h3>Sensible retention</h3><p>Keep the newest run of each of the last 14 days, 8 weeks and 12 months, or any mix. Nothing is deleted after a bad night.</p></div>
         <div class="feature"><h3>A report every morning</h3><p>An HTML email with every folder, database and upload, a status file for monitoring, and an exit code equal to the number of errors.</p></div>
       </div>

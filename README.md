@@ -165,6 +165,7 @@ Inside `<config>`:
 | `dropbox_chunksize` | `33554432` (32 MiB) | Upload chunk size in bytes; rounded to 4 MiB steps, max 148 MiB |
 | `tar_exe` | `tar` | The GNU tar to use |
 | `retention` | keep everything | See [Retention](#retention) |
+| `global_exclude` | none | Repeatable. A tar exclude pattern applied to **every** folder, e.g. `.env`. See [Keep secrets out](#keep-secrets-out) |
 
 ### Folders
 
@@ -202,6 +203,26 @@ Each `<folder>` in `<folder_list>` becomes one archive (or one per sub-folder wh
   leading `/`. Leading and trailing slashes are ignored, so `/opt/big-thing/` works the same as
   `opt/big-thing`. Patterns like `*.log` match anywhere. Exclude anything that holds secrets you do not want
   in Dropbox, such as the folder with Shoebox's own `.env` if it is not in `/etc`.
+- To leave a pattern out of **every** folder, put it in `<config>` as a `<global_exclude>` instead (below).
+
+#### Keep secrets out
+
+Backups are not encrypted, so you may not want app secrets such as `.env` files in Dropbox. A pattern with no
+`/` in it matches a file or folder of that name **at any depth**, so these lines in `<config>` leave out every
+`.env` file in every folder Shoebox archives:
+
+```xml
+<global_exclude>.env</global_exclude>     <!-- .env -->
+<global_exclude>.env.*</global_exclude>   <!-- .env.production, .env.bak-2026, also .env.example -->
+<global_exclude>.env-*</global_exclude>   <!-- .env-live, .env-local -->
+```
+
+`*` matches any characters, `?` one character, and matching is case-sensitive. There is no "except" pattern,
+so `.env.*` also drops `.env.example`; that file is usually in git anyway. Run `shoebox check` to see the
+excludes each folder gets.
+
+**If you exclude secrets, keep them somewhere else.** A restore from Shoebox alone will then be missing
+them, so keep a copy in a password manager or in an encrypted backup.
 
 Shoebox never archives its own backups: `local_folder` is left out of any folder that contains it (even `/`),
 and a `folder_path` inside `local_folder` is an error. Symlinks inside a folder are stored as links. Files
@@ -511,6 +532,8 @@ S=/var/log/shoebox/status.json
   cannot see the rest of the account, and a stolen token cannot see anything else.
 - **`.env` holds the secrets.** Keep it mode 600 and owned by root. Shoebox creates it that way when `auth`
   writes the token. Exclude it from folder backups if it is not under `/etc`, or accept that it is in Dropbox.
+- **App secrets.** `<global_exclude>.env</global_exclude>` keeps every `.env` file out of every archive (see
+  [Keep secrets out](#keep-secrets-out)). Database dumps still hold the data itself.
 - **Local copies** are written with mode 700 folders and 600 files.
 - **No secrets on command lines.** Database passwords go through `MYSQL_PWD` in the environment; with
   `password_container_env` the password never leaves the container. The Dropbox token is sent only to

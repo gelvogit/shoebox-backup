@@ -21,6 +21,13 @@
 		<dropbox_chunksize>33554432</dropbox_chunksize>  <!-- default 32 MiB. Upload chunk in bytes (4 MiB steps, max 148 MiB) -->
 		<tar_exe>tar</tar_exe>                           <!-- default tar. Must be GNU tar -->
 
+		<!-- Optional, repeatable: tar exclude patterns for EVERY folder. A pattern without a "/" matches that
+		     name at any depth, so these keep app secrets (.env, .env.production, .env-live ...) out of Dropbox.
+		     Keep those secrets somewhere else (a password manager or an encrypted backup). -->
+		<global_exclude>.env</global_exclude>
+		<global_exclude>.env.*</global_exclude>
+		<global_exclude>.env-*</global_exclude>
+
 		<!-- Dropbox retention: keep the newest run of each of the last N days, weeks and months.
 		     Leave the whole element out to keep every run. -->
 		<retention>
